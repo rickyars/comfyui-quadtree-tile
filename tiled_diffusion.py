@@ -13,6 +13,9 @@ from comfy.utils import common_upscale
 from comfy.model_management import processing_interrupted, loaded_models, load_models_gpu
 from math import pi
 
+# Import quadtree classes from tiled_vae
+from .tiled_vae import QuadtreeNode, QuadtreeBuilder
+
 opt_C = 4
 opt_f = 8
 
@@ -84,6 +87,68 @@ def split_bboxes(w:int, h:int, tile_w:int, tile_h:int, overlap:int=16, init_weig
 
     return bbox_list, weight
 
+def split_bboxes_quadtree(w: int, h: int, content_threshold: float, max_depth: int,
+                          min_tile_size: int, min_denoise: float, max_denoise: float,
+                          init_weight: Union[Tensor, float] = 1.0, device='cpu') -> Tuple[List[BBox], Tensor, List]:
+    """
+    Create bboxes using adaptive quadtree subdivision
+
+    Note: Unlike image-based quadtree in VAE, this creates a FIXED quadtree structure
+    based on dimensions and depth parameters (similar to how grid creates a fixed grid).
+    This is because diffusion operates on noisy latents which have no meaningful structure to analyze.
+
+    Returns:
+        bbox_list: List of BBox objects for each tile
+        weight: Weight tensor for blending
+        leaves: List of QuadtreeNode leaf nodes (with denoise values)
+    """
+    # Build quadtree structure based purely on dimensions and parameters
+    # We create a dummy tensor just for dimensions - content doesn't matter for diffusion
+    import torch
+    dummy_tensor = torch.zeros((1, 1, h, w), device=device)
+
+    builder = QuadtreeBuilder(
+        content_threshold=999.0,  # Set very high so it ALWAYS subdivides based on depth/size only
+        max_depth=max_depth,
+        min_tile_size=min_tile_size,
+        min_denoise=min_denoise,
+        max_denoise=max_denoise
+    )
+
+    root, leaves = builder.build(dummy_tensor)
+
+    # Convert quadtree leaves to BBox list
+    bbox_list: List[BBox] = []
+    weight = torch.zeros((1, 1, h, w), device=device, dtype=torch.float32)
+
+    for leaf in leaves:
+        # Create BBox from leaf node
+        bbox = BBox(leaf.x, leaf.y, leaf.w, leaf.h)
+
+        # Store denoise value in bbox for later use
+        bbox.denoise = leaf.denoise
+        bbox.variance = leaf.variance
+
+        bbox_list.append(bbox)
+        weight[bbox.slicer] += init_weight
+
+    print(f'[Quadtree Diffusion]: Created {len(bbox_list)} adaptive tiles')
+    print(f'[Quadtree Diffusion]: Tile sizes: {min(l.w * l.h for l in leaves)} to {max(l.w * l.h for l in leaves)} pixels')
+    print(f'[Quadtree Diffusion]: Variance range: {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
+    print(f'[Quadtree Diffusion]: Denoise range: {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
+
+    # Show distribution of tile sizes for debugging
+    size_counts = {}
+    for leaf in leaves:
+        size_key = (leaf.w, leaf.h)
+        size_counts[size_key] = size_counts.get(size_key, 0) + 1
+    print(f'[Quadtree Diffusion]: Tile size distribution: {len(size_counts)} unique sizes')
+    sorted_sizes = sorted(size_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    for (w, h), count in sorted_sizes:
+        print(f'  {w}x{h}: {count} tiles')
+
+    return bbox_list, weight, leaves
+
 class CustomBBox(BBox):
     ''' region control bbox '''
     pass
@@ -152,23 +217,23 @@ class AbstractDiffusion:
         self.sigmas = None
 
     def reset(self):
-        tile_width = self.tile_width
-        tile_height = self.tile_height
-        tile_overlap = self.tile_overlap
+        # Preserve essential parameters
         tile_batch_size = self.tile_batch_size
         compression = self.compression
-        width = self.width
-        height  = self.height 
-        overlap = self.overlap
+        tile_overlap = getattr(self, 'tile_overlap', 8)
+
+        # Preserve quadtree structure
+        use_quadtree = getattr(self, 'use_quadtree', False)
+        quadtree_from_visualizer = getattr(self, 'quadtree_from_visualizer', None)
+
         self.__init__()
         self.compression = compression
-        self.width = width
-        self.height  = height
-        self.overlap = overlap
-        self.tile_width = tile_width
-        self.tile_height = tile_height
-        self.tile_overlap = tile_overlap
         self.tile_batch_size = tile_batch_size
+        self.tile_overlap = tile_overlap
+
+        # Restore quadtree structure
+        self.use_quadtree = use_quadtree
+        self.quadtree_from_visualizer = quadtree_from_visualizer
 
     def repeat_tensor(self, x:Tensor, n:int, concat=False, concat_to=0) -> Tensor:
         ''' repeat the tensor on it's first dim '''
@@ -221,6 +286,101 @@ class AbstractDiffusion:
         self.num_batches = ceildiv(self.num_tiles , tile_bs)
         self.tile_bs = ceildiv(len(bboxes) , self.num_batches)          # optimal_batch_size
         self.batched_bboxes = [bboxes[i*self.tile_bs:(i+1)*self.tile_bs] for i in range(self.num_batches)]
+
+    @grid_bbox
+    def init_quadtree_bbox(self, latent_tensor: Tensor, tile_bs: int):
+        """Initialize bboxes using quadtree subdivision with overlap"""
+        self.weights = torch.zeros((1, 1, self.h, self.w), device=devices.device, dtype=torch.float32)
+        self.enable_grid_bbox = True
+
+        # Get overlap parameter (default to 8 pixels in latent space, which is 64 pixels in image space)
+        overlap = getattr(self, 'tile_overlap', 8)
+        overlap = max(0, min(overlap, min(self.h, self.w) // 4))  # Clamp overlap to reasonable range
+
+        # Check if we have a quadtree from visualizer to reuse
+        visualizer_quadtree = getattr(self, 'quadtree_from_visualizer', None)
+
+        if visualizer_quadtree is not None:
+            num_leaves = len(visualizer_quadtree["leaves"])
+            print(f'[Quadtree Diffusion]: Processing {num_leaves} tiles with {overlap}px overlap (latent space)')
+
+            # Warning for too many tiles
+            if num_leaves > 100:
+                print(f'[Quadtree Diffusion]: ⚠️  {num_leaves} tiles may be slow. Consider increasing min_tile_size to 512-768px.')
+
+            # Warning for overlap >= smallest tile
+            if overlap > 0:
+                min_tile_size = min(leaf.w * leaf.h for leaf in visualizer_quadtree["leaves"])
+                min_tile_dim = int(min_tile_size ** 0.5) // 8
+                if overlap >= min_tile_dim:
+                    print(f'[Quadtree Diffusion]: ⚠️  Overlap ({overlap}px) >= smallest tile (~{min_tile_dim}px). Reduce overlap or increase min_tile_size.')
+
+            # Reuse the quadtree structure from Visualizer
+            # Note: Visualizer operates in image space (8x larger), so we need to scale coordinates
+            leaves = visualizer_quadtree['leaves']
+            bbox_list = []
+            for leaf in leaves:
+                # Scale from image space to latent space (divide by 8)
+                core_x, core_y = leaf.x // 8, leaf.y // 8
+                core_w, core_h = leaf.w // 8, leaf.h // 8
+
+                # Expand by overlap, clamping to image boundaries
+                # This is simple: add overlap on all sides, clamp to [0, width/height]
+                x = max(0, core_x - overlap)
+                y = max(0, core_y - overlap)
+                x2 = min(self.w, core_x + core_w + overlap)
+                y2 = min(self.h, core_y + core_h + overlap)
+
+                w = x2 - x
+                h = y2 - y
+
+                bbox = BBox(x, y, w, h)
+                bbox.denoise = leaf.denoise
+                bbox.variance = leaf.variance
+                bbox.core_region = (core_x, core_y, core_w, core_h)  # Store the non-overlapping core
+                bbox_list.append(bbox)
+
+                # For overlap mode, accumulate actual Gaussian weights
+                if overlap > 0:
+                    tile_weights = self.get_weight(w, h)
+                    self.weights[bbox.slicer] += tile_weights
+                else:
+                    # For non-overlap mode, just count coverage (but we use direct assignment anyway)
+                    self.weights[bbox.slicer] += self.get_tile_weights()
+
+            bboxes = bbox_list
+            leaves = visualizer_quadtree['leaves']
+        else:
+            # No quadtree provided - this shouldn't happen in normal usage
+            raise ValueError('[Quadtree Diffusion]: No quadtree structure provided! Connect QuadtreeVisualizer output to the quadtree input.')
+
+        self.quadtree_leaves = leaves  # Store for potential later use
+        self.num_tiles = len(bboxes)
+
+        # For quadtree, batch tiles by ACTUAL size (after overlap expansion)
+        # Tiles with the same actual dimensions can be batched together efficiently
+        from collections import defaultdict
+
+        # Group tiles by ACTUAL size (after overlap is applied)
+        # This allows PyTorch to concatenate them without padding overhead
+        actual_size_groups = defaultdict(list)
+        for bbox in bboxes:
+            # Use actual tile size for grouping
+            size_key = (bbox.w, bbox.h)  # (width, height) after overlap
+            actual_size_groups[size_key].append(bbox)
+
+        # Create batches: batch same-sized tiles together up to tile_bs
+        self.batched_bboxes = []
+        for size_key, group_bboxes in actual_size_groups.items():
+            # Split this size group into batches of tile_bs tiles each
+            for i in range(0, len(group_bboxes), tile_bs):
+                batch = group_bboxes[i:i+tile_bs]
+                self.batched_bboxes.append(batch)
+
+        self.num_batches = len(self.batched_bboxes)
+
+        # Print statistics
+        print(f'[Quadtree Diffusion]: {len(actual_size_groups)} unique tile sizes -> {self.num_batches} batches (batch_size={tile_bs})')
 
     # detached version of above
     @grid_bbox
@@ -464,7 +624,7 @@ def gaussian_weights(tile_w:int, tile_h:int) -> Tensor:
 class CondDict: ...
 
 class MultiDiffusion(AbstractDiffusion):
-    
+
     @torch.inference_mode()
     def __call__(self, model_function: BaseModel.apply_model, args: dict):
         x_in: Tensor = args["input"]
@@ -479,7 +639,18 @@ class MultiDiffusion(AbstractDiffusion):
         if self.weights is None or self.h != H or self.w != W:
             self.h, self.w = H, W
             self.refresh = True
-            self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
+
+            # Check if quadtree mode is enabled
+            use_qt = getattr(self, 'use_quadtree', False)
+            print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
+
+            if use_qt:
+                print(f'[Quadtree Diffusion DEBUG]: Calling init_quadtree_bbox()')
+                self.init_quadtree_bbox(x_in, self.tile_batch_size)
+            else:
+                print(f'[Quadtree Diffusion DEBUG]: Calling init_grid_bbox() - NOT using quadtree')
+                self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
+
             # init everything done, perform sanity check & pre-computations
             self.init_done()
         self.h, self.w = H, W
@@ -529,7 +700,11 @@ class MultiDiffusion(AbstractDiffusion):
 
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
+                # Check if we're using quadtree mode
+                use_qt = getattr(self, 'use_quadtree', False)
+
                 for i, bbox in enumerate(bboxes):
+                    # Both quadtree and grid tiles use accumulation with overlap
                     self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
                 del x_tile_out, x_tile, t_tile, c_tile
 
@@ -537,6 +712,7 @@ class MultiDiffusion(AbstractDiffusion):
                 # self.update_pbar()
 
         # Averaging background buffer
+        # Both grid and quadtree modes now use overlap, so average by weights
         x_out = torch.where(self.weights > 1, self.x_buffer / self.weights, self.x_buffer)
 
         return x_out
@@ -586,7 +762,18 @@ class SpotDiffusion(AbstractDiffusion):
         if self.weights is None or self.h != H or self.w != W:
             self.h, self.w = H, W
             self.refresh = True
-            self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
+
+            # Check if quadtree mode is enabled
+            use_qt = getattr(self, 'use_quadtree', False)
+            print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
+
+            if use_qt:
+                print(f'[Quadtree Diffusion DEBUG]: Calling init_quadtree_bbox()')
+                self.init_quadtree_bbox(x_in, self.tile_batch_size)
+            else:
+                print(f'[Quadtree Diffusion DEBUG]: Calling init_grid_bbox() - NOT using quadtree')
+                self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
+
             # init everything done, perform sanity check & pre-computations
             self.init_done()
         self.h, self.w = H, W
@@ -726,7 +913,12 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 self.custom_weights[bbox_id] *= self.rescale_factor[bbox.slicer]
 
     @grid_bbox
-    def get_tile_weights(self) -> Tensor:
+    def get_tile_weights(self) -> Union[Tensor, float]:
+        # For quadtree mode, we still use Gaussian weights but generate them per-tile
+        # We return 1.0 here because we'll compute per-tile weights during processing
+        if getattr(self, 'use_quadtree', False):
+            return 1.0
+
         # weights for grid bboxes
         # if not hasattr(self, 'tile_weights'):
         # x_in can change sizes cause of ConditioningSetArea, so we have to recalcualte each time
@@ -742,12 +934,20 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
         N, C, H, W = x_in.shape
 
+        # Check if quadtree mode is enabled (needed throughout the function)
+        use_qt = getattr(self, 'use_quadtree', False)
+
         self.refresh = False
         # self.refresh = True
         if self.weights is None or self.h != H or self.w != W:
             self.h, self.w = H, W
             self.refresh = True
-            self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
+
+            if use_qt:
+                self.init_quadtree_bbox(x_in, self.tile_batch_size)
+            else:
+                self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
+
             # init everything done, perform sanity check & pre-computations
             self.init_done()
         self.h, self.w = H, W
@@ -760,13 +960,31 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # Global sampling
         if self.draw_background:
             for batch_id, bboxes in enumerate(self.batched_bboxes):     # batch_id is the `Latent tile batch size`
-                if processing_interrupted(): 
+                if processing_interrupted():
                     # self.pbar.close()
                     return x_in
                 # batching
                 x_tile_list     = []
-                for bbox in bboxes:
-                    x_tile_list.append(x_in[bbox.slicer])
+
+                # For quadtree with overlap, tiles in same batch may have slightly different sizes
+                # due to border clamping. We need to pad them to the same size for concatenation.
+                if use_qt and len(bboxes) > 1:
+                    # Find maximum size in this batch
+                    max_h = max(bbox.h for bbox in bboxes)
+                    max_w = max(bbox.w for bbox in bboxes)
+
+                    for bbox in bboxes:
+                        tile = x_in[bbox.slicer]
+                        # Pad if needed
+                        if tile.shape[-2] < max_h or tile.shape[-1] < max_w:
+                            pad_h = max_h - tile.shape[-2]
+                            pad_w = max_w - tile.shape[-1]
+                            # Pad: (left, right, top, bottom)
+                            tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h), mode='replicate')
+                        x_tile_list.append(tile)
+                else:
+                    for bbox in bboxes:
+                        x_tile_list.append(x_in[bbox.slicer])
 
                 x_tile = torch.cat(x_tile_list, dim=0)                     # differs each
                 t_tile = repeat_to_batch_size(t_in, x_tile.shape[0])   # just repeat
@@ -776,18 +994,18 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         if len(v.shape) == len(x_tile.shape):
                             bboxes_ = bboxes
                             if v.shape[-2:] != x_in.shape[-2:]:
+                                # Conditioning tensor has different resolution - need to scale bboxes
                                 cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
-                                bboxes_ = self.get_grid_bbox(
-                                    (tile_w := self.width // cf),
-                                    (tile_h := self.height // cf),
-                                    self.overlap // cf,
-                                    self.tile_batch_size,
-                                    v.shape[-1],
-                                    v.shape[-2],
-                                    x_in.device,
-                                    lambda: self.get_weight(tile_w, tile_h),
-                                )
-                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_[batch_id]])
+                                # Scale the quadtree bboxes to match conditioning resolution
+                                scaled_bboxes = []
+                                for batch in self.batched_bboxes:
+                                    scaled_batch = []
+                                    for bbox in batch:
+                                        scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
+                                        scaled_batch.append(scaled_bbox)
+                                    scaled_bboxes.append(scaled_batch)
+                                bboxes_ = scaled_bboxes[batch_id]
+                            v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
                     c_tile[k] = v
@@ -806,10 +1024,32 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
                 # de-batching
                 for i, bbox in enumerate(bboxes):
-                    # These weights can be calcluated in advance, but will cost a lot of vram 
-                    # when you have many tiles. So we calculate it here.
-                    w = self.tile_weights * self.rescale_factor[bbox.slicer]
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :] * w
+                    # Get the output tile
+                    tile_out = x_tile_out[i*N:(i+1)*N, :, :, :]
+
+                    # Crop if we padded this tile earlier
+                    if tile_out.shape[-2] > bbox.h or tile_out.shape[-1] > bbox.w:
+                        tile_out = tile_out[:, :, :bbox.h, :bbox.w]
+
+                    if use_qt:
+                        # In quadtree mode
+                        if self.tile_overlap > 0:
+                            # With overlap enabled, use weighted blending
+                            # Generate Gaussian weights for this specific tile size
+                            tile_weights = self.get_weight(bbox.w, bbox.h)
+                            # Reshape to [1, 1, H, W] for proper broadcasting with 4D tensors
+                            tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
+                            # Add weighted tile to buffer - normalization will happen after all tiles are processed
+                            self.x_buffer[bbox.slicer] += tile_out * tile_weights
+                        else:
+                            # Without overlap, tiles don't overlap - use simple direct assignment
+                            self.x_buffer[bbox.slicer] = tile_out
+                    else:
+                        # In grid mode, tiles overlap - use weighted blending
+                        # These weights can be calcluated in advance, but will cost a lot of vram
+                        # when you have many tiles. So we calculate it here.
+                        w = self.tile_weights * self.rescale_factor[bbox.slicer]
+                        self.x_buffer[bbox.slicer] += tile_out * w
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # self.update_pbar()
@@ -817,19 +1057,25 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # self.pbar.close()
         x_out = self.x_buffer
 
+        # For quadtree with overlap, normalize by accumulated weights
+        if use_qt and self.tile_overlap > 0:
+            print(f'[Quadtree Diffusion DEBUG]: x_out shape={x_out.shape}, weights shape={self.weights.shape}')
+            print(f'[Quadtree Diffusion DEBUG]: weights min={self.weights.min():.4f}, max={self.weights.max():.4f}, mean={self.weights.mean():.4f}')
+            x_out = x_out / self.weights
+            print(f'[Quadtree Diffusion DEBUG]: After normalization, x_out min={x_out.min():.4f}, max={x_out.max():.4f}')
+
         return x_out
 
 MAX_RESOLUTION=8192
 class TiledDiffusion():
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"model": ("MODEL", ),
+        return {"required": {
+                                "model": ("MODEL", ),
                                 "method": (["MultiDiffusion", "Mixture of Diffusers", "SpotDiffusion"], {"default": "Mixture of Diffusers"}),
-                                # "tile_width": ("INT", {"default": 96, "min": 16, "max": 256, "step": 16}),
-                                "tile_width": ("INT", {"default": 96*opt_f, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
-                                # "tile_height": ("INT", {"default": 96, "min": 16, "max": 256, "step": 16}),
-                                "tile_height": ("INT", {"default": 96*opt_f, "min": 16, "max": MAX_RESOLUTION, "step": 16}),
-                                "tile_overlap": ("INT", {"default": 8*opt_f, "min": 0, "max": 256*opt_f, "step": 4*opt_f}),
+                                "quadtree": ("QUADTREE",),
+                                "enable_overlap": ("BOOLEAN", {"default": False, "tooltip": "Enable tile overlap for smoother blending. Currently experimental."}),
+                                "tile_overlap": ("INT", {"default": 16*opt_f, "min": opt_f, "max": 256*opt_f, "step": opt_f, "tooltip": "Overlap between tiles in pixels (image space). Minimum 8px (1px latent). Gets divided by 8 for latent space."}),
                                 "tile_batch_size": ("INT", {"default": 4, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
                             }}
     RETURN_TYPES = ("MODEL",)
@@ -840,35 +1086,39 @@ class TiledDiffusion():
     @classmethod
     def IS_CHANGED(s, *args, **kwargs):
         for o in s.instances:
-            o.impl.reset()
+            if hasattr(o, 'impl') and o.impl is not None:
+                o.impl.reset()
         return ""
     
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, tile_width, tile_height, tile_overlap, tile_batch_size):
+    def apply(self, model: ModelPatcher, method, quadtree, enable_overlap, tile_overlap, tile_batch_size):
+
+        print(f'[Quadtree Diffusion]: Overlap: {"enabled" if enable_overlap else "disabled"}{f" ({tile_overlap}px)" if enable_overlap else ""}')
+
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
         elif method == "MultiDiffusion":
             self.impl = MultiDiffusion()
         else:
             self.impl = SpotDiffusion()
-        
+
         # if noise_inversion:
         #     get_cache_callback = self.noise_inverse_get_cache
         #     set_cache_callback = None # lambda x0, xt, prompts: self.noise_inverse_set_cache(p, x0, xt, prompts, steps, retouch)
         #     self.impl.init_noise_inverse(steps, retouch, get_cache_callback, set_cache_callback, renoise_strength, renoise_kernel_size)
 
+        # Set compression for latent space calculations
         compression = 4 if "CASCADE" in str(model.model.model_type) else 8
-        self.impl.tile_width = tile_width // compression
-        self.impl.tile_height = tile_height // compression
-        self.impl.tile_overlap = tile_overlap // compression
-        self.impl.tile_batch_size = tile_batch_size
-        
         self.impl.compression = compression
-        self.impl.width = tile_width
-        self.impl.height  = tile_height
-        self.impl.overlap = tile_overlap
+
+        # Store quadtree structure, overlap, and batch size
+        self.impl.use_quadtree = True
+        self.impl.quadtree_from_visualizer = quadtree
+        self.impl.enable_overlap = enable_overlap
+        self.impl.tile_overlap = (tile_overlap // compression) if enable_overlap else 0  # Convert to latent space or disable
+        self.impl.tile_batch_size = tile_batch_size
 
         # self.impl.init_grid_bbox(tile_width, tile_height, tile_overlap, tile_batch_size)
         # # init everything done, perform sanity check & pre-computations
@@ -918,12 +1168,12 @@ class NoiseInversion():
         return (latent_image,)
 
 NODE_CLASS_MAPPINGS = {
-    "TiledDiffusion": TiledDiffusion,
-    "SpotDiffusionParams_TiledDiffusion": SpotDiffusionParams,
+    "QuadtreeDiffusion": TiledDiffusion,
+    "SpotDiffusionParams_QuadtreeDiffusion": SpotDiffusionParams,
     # "NoiseInversion": NoiseInversion,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TiledDiffusion": "Tiled Diffusion",
-    "SpotDiffusionParams_TiledDiffusion": "SpotDiffusion Parameters",
+    "QuadtreeDiffusion": "Quadtree Diffusion",
+    "SpotDiffusionParams_QuadtreeDiffusion": "SpotDiffusion Parameters (Quadtree)",
     # "NoiseInversion": "Noise Inversion",
 }
