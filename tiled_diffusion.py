@@ -122,8 +122,21 @@ def split_bboxes_quadtree(w: int, h: int, content_threshold: float, max_depth: i
     weight = torch.zeros((1, 1, h, w), device=device, dtype=torch.float32)
 
     for leaf in leaves:
-        # Create BBox from leaf node
-        bbox = BBox(leaf.x, leaf.y, leaf.w, leaf.h)
+        # Clamp tile to actual image bounds (since root may be larger square)
+        tile_x = min(leaf.x, w - 1)
+        tile_y = min(leaf.y, h - 1)
+        tile_w = min(leaf.w, w - tile_x)
+        tile_h = min(leaf.h, h - tile_y)
+
+        # Skip tiles that are completely outside the image or too small
+        if tile_w <= 0 or tile_h <= 0 or tile_x >= w or tile_y >= h:
+            continue
+
+        # For true quadtree, ensure tile remains square after clamping
+        tile_size = min(tile_w, tile_h)
+
+        # Create BBox from clamped dimensions
+        bbox = BBox(tile_x, tile_y, tile_size, tile_size)
 
         # Store denoise value in bbox for later use
         bbox.denoise = leaf.denoise

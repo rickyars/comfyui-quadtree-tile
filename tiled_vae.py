@@ -100,7 +100,10 @@ class QuadtreeNode:
         return len(self.children) == 0
 
     def subdivide(self):
-        """Subdivide this node into 4 children with 8-pixel alignment for VAE compatibility"""
+        """Subdivide this node into 4 children with 8-pixel alignment for VAE compatibility
+
+        Modified to create SQUARE tiles instead of rectangles for proper quadtree structure.
+        """
         # Ensure subdivisions are aligned to 8-pixel boundaries for VAE encoder/decoder
         # VAE downsamples by 8x, so tiles must be divisible by 8
         half_w = (self.w // 2) // 8 * 8  # Round down to nearest multiple of 8
@@ -110,12 +113,16 @@ class QuadtreeNode:
         half_w = max(half_w, 8)
         half_h = max(half_h, 8)
 
-        # Create 4 child nodes (top-left, top-right, bottom-left, bottom-right)
+        # CRITICAL FIX: Use the same size for both dimensions to create SQUARES, not rectangles
+        # This is essential for a proper quadtree structure
+        half_size = min(half_w, half_h)
+
+        # Create 4 child nodes with SQUARE dimensions (top-left, top-right, bottom-left, bottom-right)
         self.children = [
-            QuadtreeNode(self.x, self.y, half_w, half_h, self.depth + 1),  # Top-left
-            QuadtreeNode(self.x + half_w, self.y, self.w - half_w, half_h, self.depth + 1),  # Top-right
-            QuadtreeNode(self.x, self.y + half_h, half_w, self.h - half_h, self.depth + 1),  # Bottom-left
-            QuadtreeNode(self.x + half_w, self.y + half_h, self.w - half_w, self.h - half_h, self.depth + 1),  # Bottom-right
+            QuadtreeNode(self.x, self.y, half_size, half_size, self.depth + 1),  # Top-left
+            QuadtreeNode(self.x + half_size, self.y, half_size, half_size, self.depth + 1),  # Top-right
+            QuadtreeNode(self.x, self.y + half_size, half_size, half_size, self.depth + 1),  # Bottom-left
+            QuadtreeNode(self.x + half_size, self.y + half_size, half_size, half_size, self.depth + 1),  # Bottom-right
         ]
 
     def get_bbox(self):
@@ -231,7 +238,11 @@ class QuadtreeBuilder:
             w_aligned = (w // 8) * 8
             h_aligned = (h // 8) * 8
 
-            root_node = QuadtreeNode(0, 0, w_aligned, h_aligned, 0)
+            # CRITICAL FIX: For proper quadtree with SQUARE tiles, root must be square
+            # Use the maximum dimension to ensure the entire image is covered
+            max_size = max(w_aligned, h_aligned)
+
+            root_node = QuadtreeNode(0, 0, max_size, max_size, 0)
 
         # Calculate variance for this node
         variance = self.calculate_variance(tensor, root_node.x, root_node.y, root_node.w, root_node.h)
