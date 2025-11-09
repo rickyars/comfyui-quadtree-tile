@@ -100,9 +100,11 @@ class QuadtreeNode:
         return len(self.children) == 0
 
     def subdivide(self):
-        """Subdivide this node into 4 children with 8-pixel alignment for VAE compatibility
+        """Subdivide this node into square children with 8-pixel alignment for VAE compatibility
 
-        Modified to create SQUARE tiles instead of rectangles for proper quadtree structure.
+        Handles both square and rectangular parent nodes:
+        - Square parent → 4 square children (classic quadtree)
+        - Rectangular parent → multiple square children to cover full area
         """
         # Ensure subdivisions are aligned to 8-pixel boundaries for VAE encoder/decoder
         # VAE downsamples by 8x, so tiles must be divisible by 8
@@ -113,17 +115,31 @@ class QuadtreeNode:
         half_w = max(half_w, 8)
         half_h = max(half_h, 8)
 
-        # CRITICAL FIX: Use the same size for both dimensions to create SQUARES, not rectangles
-        # This is essential for a proper quadtree structure
-        half_size = min(half_w, half_h)
+        # CRITICAL: All children must be SQUARE (not rectangular)
+        # Use the minimum dimension to determine square size
+        square_size = min(half_w, half_h)
 
-        # Create 4 child nodes with SQUARE dimensions (top-left, top-right, bottom-left, bottom-right)
-        self.children = [
-            QuadtreeNode(self.x, self.y, half_size, half_size, self.depth + 1),  # Top-left
-            QuadtreeNode(self.x + half_size, self.y, half_size, half_size, self.depth + 1),  # Top-right
-            QuadtreeNode(self.x, self.y + half_size, half_size, half_size, self.depth + 1),  # Bottom-left
-            QuadtreeNode(self.x + half_size, self.y + half_size, half_size, half_size, self.depth + 1),  # Bottom-right
-        ]
+        # For rectangular parents, we need to tile squares to cover the full area
+        # Calculate how many squares we need in each dimension
+        cols = (self.w + square_size - 1) // square_size  # Ceiling division
+        rows = (self.h + square_size - 1) // square_size
+
+        self.children = []
+        for row in range(rows):
+            for col in range(cols):
+                child_x = self.x + col * square_size
+                child_y = self.y + row * square_size
+
+                # Clamp to parent bounds
+                child_w = min(square_size, self.x + self.w - child_x)
+                child_h = min(square_size, self.y + self.h - child_y)
+
+                # Only add if child is within parent bounds
+                if child_w > 0 and child_h > 0:
+                    # Make it square (may be smaller at edges)
+                    child_size = min(child_w, child_h)
+                    child = QuadtreeNode(child_x, child_y, child_size, child_size, self.depth + 1)
+                    self.children.append(child)
 
     def get_bbox(self):
         """Get bounding box in [x1, x2, y1, y2] format"""
@@ -238,11 +254,9 @@ class QuadtreeBuilder:
             w_aligned = (w // 8) * 8
             h_aligned = (h // 8) * 8
 
-            # CRITICAL FIX: For proper quadtree with SQUARE tiles, root must be square
-            # Use the maximum dimension to ensure the entire image is covered
-            max_size = max(w_aligned, h_aligned)
-
-            root_node = QuadtreeNode(0, 0, max_size, max_size, 0)
+            # IMPORTANT: Root node can be rectangular to cover the actual image
+            # Only subdivisions need to be square (handled in subdivide() method)
+            root_node = QuadtreeNode(0, 0, w_aligned, h_aligned, 0)
 
         # Calculate variance for this node
         variance = self.calculate_variance(tensor, root_node.x, root_node.y, root_node.w, root_node.h)
@@ -1211,11 +1225,41 @@ class QuadtreeVisualizer:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "content_threshold": ("FLOAT", {"default": 0.05, "min": 0.005, "max": 0.25, "step": 0.005}),
-                "max_depth": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1}),
-                "min_tile_size": ("INT", {"default": 512, "min": 96, "max": 1024, "step": 16, "tooltip": "Minimum tile size in pixels (image space). Recommended: 512-768px for diffusion. Smaller values create more tiles but may be slower."}),
-                "min_denoise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "max_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "content_threshold": ("FLOAT", {
+                    "default": 0.05,
+                    "min": 0.001,
+                    "max": 0.5,
+                    "step": 0.001,
+                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas. Try 0.01-0.05 for balanced, 0.001-0.01 for aggressive subdivision, 0.1+ for minimal subdivision."
+                }),
+                "max_depth": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "tooltip": "Maximum subdivision depth. Higher = smaller minimum tiles. 5 = up to 32x32 grid, 6 = 64x64 grid"
+                }),
+                "min_tile_size": ("INT", {
+                    "default": 256,
+                    "min": 64,
+                    "max": 2048,
+                    "step": 16,
+                    "tooltip": "Minimum tile size in pixels (image space). 256-512px recommended for most cases. Smaller = more tiles but slower."
+                }),
+                "min_denoise": ("FLOAT", {
+                    "default": 0.2,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Denoise strength for largest tiles (low complexity areas). 0.0 = preserve completely, 1.0 = regenerate completely"
+                }),
+                "max_denoise": ("FLOAT", {
+                    "default": 0.8,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Denoise strength for smallest tiles (high complexity areas). Should be >= min_denoise"
+                }),
                 "line_thickness": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
             }
         }

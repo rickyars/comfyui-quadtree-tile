@@ -950,6 +950,15 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # Check if quadtree mode is enabled (needed throughout the function)
         use_qt = getattr(self, 'use_quadtree', False)
 
+        # Store sigmas for variable denoise (from store if available)
+        if not hasattr(self, 'sigmas') or self.sigmas is None:
+            try:
+                from .utils import store
+                if hasattr(store, 'sigmas'):
+                    self.sigmas = store.sigmas
+            except:
+                pass
+
         self.refresh = False
         # self.refresh = True
         if self.weights is None or self.h != H or self.w != W:
@@ -958,6 +967,16 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
             if use_qt:
                 self.init_quadtree_bbox(x_in, self.tile_batch_size)
+                # Print denoise range for quadtree tiles
+                if hasattr(self, 'batched_bboxes') and len(self.batched_bboxes) > 0:
+                    all_denoise = [bbox.denoise for batch in self.batched_bboxes for bbox in batch if hasattr(bbox, 'denoise')]
+                    if all_denoise:
+                        min_d, max_d = min(all_denoise), max(all_denoise)
+                        print(f'[Quadtree Variable Denoise]: Denoise range: {min_d:.3f} to {max_d:.3f}')
+                        if min_d < 1.0:
+                            print(f'[Quadtree Variable Denoise]: ENABLED - Tiles will be denoised adaptively')
+                        else:
+                            print(f'[Quadtree Variable Denoise]: All tiles at max denoise - no variation')
             else:
                 self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
 
@@ -1043,6 +1062,33 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     # Crop if we padded this tile earlier
                     if tile_out.shape[-2] > bbox.h or tile_out.shape[-1] > bbox.w:
                         tile_out = tile_out[:, :, :bbox.h, :bbox.w]
+
+                    # VARIABLE DENOISE: Check if this tile should be active at this timestep
+                    # Only applies to quadtree mode with denoise values
+                    tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
+
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                        # Calculate progress through denoising schedule (0 = start, 1 = end)
+                        sigmas = self.sigmas
+                        ts_in = find_nearest(t_in[0], sigmas)
+                        cur_idx = (sigmas == ts_in).nonzero()
+                        if cur_idx.shape[0] > 0:
+                            current_step = cur_idx.item()
+                            total_steps = len(sigmas) - 1
+
+                            # Progress from 0 (high noise) to 1 (low noise)
+                            progress = current_step / max(total_steps, 1)
+
+                            # For denoise=0.3, tile becomes active when progress >= 0.7 (1 - 0.3)
+                            # This matches img2img semantics: low denoise = preserve more
+                            activation_threshold = 1.0 - tile_denoise
+
+                            if progress < activation_threshold:
+                                # Tile not yet active - preserve input instead of using model output
+                                # Blend: early in schedule, use more input; later, transition to output
+                                blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
+                                tile_input = x_in[bbox.slicer]
+                                tile_out = tile_input * (1 - blend_factor) + tile_out * blend_factor
 
                     if use_qt:
                         # In quadtree mode
