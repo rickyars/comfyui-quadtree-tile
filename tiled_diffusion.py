@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from typing import List, Union, Tuple, Callable, Dict
 from weakref import WeakSet
+from collections import defaultdict
 import comfy.utils
 import comfy.model_patcher
 import comfy.model_management
@@ -171,6 +172,8 @@ class AbstractDiffusion:
         self.method = self.__class__.__name__
         self.pbar = None
 
+        # Performance: Cache for Gaussian weights to avoid recomputation
+        self.gaussian_weight_cache = {}
 
         self.w: int = 0
         self.h: int = 0
@@ -377,7 +380,6 @@ class AbstractDiffusion:
 
         # For quadtree, batch tiles by ACTUAL size (after overlap expansion)
         # Tiles with the same actual dimensions can be batched together efficiently
-        from collections import defaultdict
 
         # Group tiles by ACTUAL size (after overlap is applied)
         # This allows PyTorch to concatenate them without padding overhead
@@ -652,6 +654,9 @@ class MultiDiffusion(AbstractDiffusion):
 
         N, C, H, W = x_in.shape
 
+        # Performance: Cache use_quadtree flag once instead of multiple getattr calls
+        use_qt = getattr(self, 'use_quadtree', False)
+
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
         if self.weights is None or self.h != H or self.w != W:
@@ -659,7 +664,6 @@ class MultiDiffusion(AbstractDiffusion):
             self.refresh = True
 
             # Check if quadtree mode is enabled
-            use_qt = getattr(self, 'use_quadtree', False)
             print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
 
             if use_qt:
@@ -678,7 +682,7 @@ class MultiDiffusion(AbstractDiffusion):
         # Background sampling (grid bbox)
         if self.draw_background:
             for batch_id, bboxes in enumerate(self.batched_bboxes):
-                if processing_interrupted(): 
+                if processing_interrupted():
                     # self.pbar.close()
                     return x_in
 
@@ -717,9 +721,6 @@ class MultiDiffusion(AbstractDiffusion):
                 # self.switch_stablesr_tensors(batch_id)
 
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
-
-                # Check if we're using quadtree mode
-                use_qt = getattr(self, 'use_quadtree', False)
 
                 for i, bbox in enumerate(bboxes):
                     # Both quadtree and grid tiles use accumulation with overlap
@@ -775,6 +776,9 @@ class SpotDiffusion(AbstractDiffusion):
 
         N, C, H, W = x_in.shape
 
+        # Performance: Cache use_quadtree flag once instead of multiple getattr calls
+        use_qt = getattr(self, 'use_quadtree', False)
+
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
         if self.weights is None or self.h != H or self.w != W:
@@ -782,7 +786,6 @@ class SpotDiffusion(AbstractDiffusion):
             self.refresh = True
 
             # Check if quadtree mode is enabled
-            use_qt = getattr(self, 'use_quadtree', False)
             print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
 
             if use_qt:
@@ -919,7 +922,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
         # weights for custom bboxes
         self.custom_weights: List[Tensor] = []
-        self.get_weight = gaussian_weights
+
+    def get_weight(self, tile_w: int, tile_h: int) -> Tensor:
+        """Generate Gaussian weight matrix for a tile with caching"""
+        cache_key = (tile_w, tile_h)
+        if cache_key in self.gaussian_weight_cache:
+            return self.gaussian_weight_cache[cache_key]
+
+        # Compute Gaussian weights using the original function
+        w = gaussian_weights(tile_w, tile_h)
+
+        # Cache before returning
+        self.gaussian_weight_cache[cache_key] = w
+        return w
 
     def init_done(self):
         super().init_done()
