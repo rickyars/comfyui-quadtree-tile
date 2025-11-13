@@ -102,11 +102,11 @@ class QuadtreeNode:
     def subdivide(self):
         """Subdivide this node into 4 children with 8-pixel alignment for VAE compatibility
 
-        Strategy for square tiles:
+        Strategy:
         - Always create exactly 4 children (quadtree property)
-        - Rectangular parents → 4 rectangular children initially
-        - As we subdivide deeper, rectangles become more square
-        - Force square when we reach leaf level (min_tile_size or max_depth)
+        - Rectangular parents → 4 rectangular children
+        - Children naturally become smaller as we subdivide deeper
+        - Stop at leaf level (min_tile_size or max_depth)
         """
         # Ensure subdivisions are aligned to 8-pixel boundaries for VAE encoder/decoder
         # VAE downsamples by 8x, so tiles must be divisible by 8
@@ -118,8 +118,7 @@ class QuadtreeNode:
         half_h = max(half_h, 8)
 
         # QUADTREE PROPERTY: Always create exactly 4 children
-        # For square parents: 4 square children (classic quadtree)
-        # For rectangular parents: 4 rectangular children that become more square as we subdivide deeper
+        # Children inherit parent's proportions and become smaller as we subdivide deeper
 
         self.children = [
             QuadtreeNode(self.x, self.y, half_w, half_h, self.depth + 1),  # Top-left
@@ -215,13 +214,7 @@ class QuadtreeBuilder:
         if half_w_aligned < max(self.min_tile_size, 8) or half_h_aligned < max(self.min_tile_size, 8):
             return False
 
-        # ALWAYS subdivide if node is too rectangular (force it toward square)
-        # Calculate aspect ratio (larger / smaller)
-        aspect_ratio = max(node.w, node.h) / max(min(node.w, node.h), 1)
-        if aspect_ratio > 1.5:  # If more than 1.5:1 aspect ratio, keep subdividing
-            return True
-
-        # Otherwise, subdivide if variance is above threshold
+        # Subdivide if variance is above threshold
         return variance > self.content_threshold
 
     def build_tree(self, tensor: torch.Tensor, root_node: QuadtreeNode = None) -> QuadtreeNode:
@@ -247,8 +240,7 @@ class QuadtreeBuilder:
             w_aligned = (w // 8) * 8
             h_aligned = (h // 8) * 8
 
-            # IMPORTANT: Root node can be rectangular to cover the actual image
-            # Only subdivisions need to be square (handled in subdivide() method)
+            # Root node matches the actual image dimensions (can be rectangular)
             root_node = QuadtreeNode(0, 0, w_aligned, h_aligned, 0)
 
         # Calculate variance for this node
@@ -309,26 +301,6 @@ class QuadtreeBuilder:
             # Inverse relationship: large tiles get low denoise, small tiles get high denoise
             leaf.denoise = self.min_denoise + (self.max_denoise - self.min_denoise) * (1.0 - size_ratio)
 
-    def make_leaves_square(self, root_node: QuadtreeNode):
-        """
-        Force all leaf nodes to be square by using the minimum dimension
-
-        Args:
-            root_node: Root of the quadtree
-        """
-        leaves = self.get_leaf_nodes(root_node)
-
-        for leaf in leaves:
-            if leaf.w != leaf.h:
-                # Make it square using the minimum dimension
-                min_dim = min(leaf.w, leaf.h)
-                # Align to 8 pixels
-                min_dim = (min_dim // 8) * 8
-                min_dim = max(min_dim, 8)
-
-                leaf.w = min_dim
-                leaf.h = min_dim
-
     def build(self, tensor: torch.Tensor) -> tuple:
         """
         Build complete quadtree and return leaf nodes with denoise values
@@ -341,9 +313,6 @@ class QuadtreeBuilder:
         """
         # Build the tree
         root = self.build_tree(tensor)
-
-        # Force all leaf nodes to be square
-        self.make_leaves_square(root)
 
         # Assign denoise values
         self.assign_denoise_values(root)

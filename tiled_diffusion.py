@@ -367,6 +367,11 @@ class AbstractDiffusion:
             # No quadtree provided - this shouldn't happen in normal usage
             raise ValueError('[Quadtree Diffusion]: No quadtree structure provided! Connect QuadtreeVisualizer output to the quadtree input.')
 
+        # Validate full coverage
+        if self.weights.min() < 1e-6:
+            uncovered = (self.weights < 1e-6).sum().item()
+            raise RuntimeError(f"Quadtree has {uncovered} uncovered pixels! Bug in quadtree implementation.")
+
         self.quadtree_leaves = leaves  # Store for potential later use
         self.num_tiles = len(bboxes)
 
