@@ -321,12 +321,12 @@ class AbstractDiffusion:
             if num_leaves > 100:
                 print(f'[Quadtree Diffusion]: ⚠️  {num_leaves} tiles may be slow. Consider increasing min_tile_size to 512-768px.')
 
-            # Warning for overlap >= smallest tile
+            # Warning for overlap >= smallest tile dimension
             if overlap > 0:
-                min_tile_size = min(leaf.w * leaf.h for leaf in visualizer_quadtree["leaves"])
-                min_tile_dim = int(min_tile_size ** 0.5) // 8
+                # Find smallest tile dimension (not area) in latent space
+                min_tile_dim = min(min(leaf.w, leaf.h) for leaf in visualizer_quadtree["leaves"]) // 8
                 if overlap >= min_tile_dim:
-                    print(f'[Quadtree Diffusion]: ⚠️  Overlap ({overlap}px) >= smallest tile (~{min_tile_dim}px). Reduce overlap or increase min_tile_size.')
+                    print(f'[Quadtree Diffusion]: ⚠️  Overlap ({overlap}px latent) >= smallest tile dimension ({min_tile_dim}px latent = {min_tile_dim*8}px image). Reduce overlap or increase min_tile_size in visualizer.')
 
             # Reuse the quadtree structure from Visualizer
             # Note: Visualizer operates in image space (8x larger), so we need to scale coordinates
@@ -1120,8 +1120,22 @@ class MixtureOfDiffusers(AbstractDiffusion):
         if use_qt and self.tile_overlap > 0:
             print(f'[Quadtree Diffusion DEBUG]: x_out shape={x_out.shape}, weights shape={self.weights.shape}')
             print(f'[Quadtree Diffusion DEBUG]: weights min={self.weights.min():.4f}, max={self.weights.max():.4f}, mean={self.weights.mean():.4f}')
-            x_out = x_out / self.weights
+
+            # CRITICAL: Handle division by zero for uncovered pixels
+            # Only normalize pixels that were actually covered by tiles (weight > epsilon)
+            epsilon = 1e-6
+            mask = self.weights > epsilon
+            x_out = torch.where(mask, x_out / torch.clamp(self.weights, min=epsilon), x_out)
+
             print(f'[Quadtree Diffusion DEBUG]: After normalization, x_out min={x_out.min():.4f}, max={x_out.max():.4f}')
+
+            # Check for uncovered pixels and warn user
+            uncovered_pixels = (~mask).sum().item()
+            if uncovered_pixels > 0:
+                total_pixels = mask.numel()
+                pct = 100.0 * uncovered_pixels / total_pixels
+                print(f'[Quadtree Diffusion]: ⚠️  {uncovered_pixels}/{total_pixels} pixels ({pct:.1f}%) not covered by any tile!')
+                print(f'[Quadtree Diffusion]: This can cause artifacts. Try: increase overlap, decrease content_threshold, or increase max_depth')
 
         return x_out
 
