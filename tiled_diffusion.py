@@ -69,6 +69,44 @@ def repeat_to_batch_size(tensor, batch_size, dim=0):
         return tensor.repeat(dim * [1] + [ceildiv(batch_size, tensor.shape[dim])] + [1] * (len(tensor.shape) - 1 - dim)).narrow(dim, 0, batch_size)
     return tensor
 
+def extract_tile_with_padding(tensor: Tensor, bbox: BBox, image_w: int, image_h: int) -> Tensor:
+    """
+    Extract a tile from tensor with reflection padding if it extends beyond boundaries
+
+    Args:
+        tensor: Input tensor (B, C, H, W)
+        bbox: BBox defining the tile region (may extend beyond tensor)
+        image_w: Actual image width
+        image_h: Actual image height
+
+    Returns:
+        Extracted tile with padding applied if needed
+    """
+    x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+
+    # Calculate clamped extraction region (what we can actually extract)
+    x_start = max(0, x)
+    y_start = max(0, y)
+    x_end = min(image_w, x + w)
+    y_end = min(image_h, y + h)
+
+    # Extract the available region
+    tile = tensor[:, :, y_start:y_end, x_start:x_end]
+
+    # Calculate padding needed
+    pad_left = max(0, -x)
+    pad_right = max(0, (x + w) - image_w)
+    pad_top = max(0, -y)
+    pad_bottom = max(0, (y + h) - image_h)
+
+    # Apply reflection padding if needed
+    if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+        import torch.nn.functional as F
+        # PyTorch pad order: (left, right, top, bottom)
+        tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+
+    return tile
+
 def split_bboxes(w:int, h:int, tile_w:int, tile_h:int, overlap:int=16, init_weight:Union[Tensor, float]=1.0) -> Tuple[List[BBox], Tensor]:
     cols = ceildiv((w - overlap) , (tile_w - overlap))
     rows = ceildiv((h - overlap) , (tile_h - overlap))
@@ -340,15 +378,16 @@ class AbstractDiffusion:
                 core_x, core_y = leaf.x // 8, leaf.y // 8
                 core_w, core_h = leaf.w // 8, leaf.h // 8
 
-                # Expand by overlap, clamping to image boundaries
-                # This is simple: add overlap on all sides, clamp to [0, width/height]
-                x = max(0, core_x - overlap)
-                y = max(0, core_y - overlap)
-                x2 = min(self.w, core_x + core_w + overlap)
-                y2 = min(self.h, core_y + core_h + overlap)
+                # CRITICAL: Keep tiles SQUARE even with overlap
+                # Don't clamp to image boundaries - instead, we'll pad during extraction
+                # Expand by overlap on all sides symmetrically
+                x = core_x - overlap
+                y = core_y - overlap
+                w = core_w + 2 * overlap
+                h = core_h + 2 * overlap
 
-                w = x2 - x
-                h = y2 - y
+                # Tiles MUST remain square (w == h) for Approach A
+                assert w == h, f"Tile not square after overlap: {w}x{h} at ({x},{y})"
 
                 bbox = BBox(x, y, w, h)
                 bbox.denoise = leaf.denoise
@@ -357,12 +396,35 @@ class AbstractDiffusion:
                 bbox_list.append(bbox)
 
                 # For overlap mode, accumulate actual Gaussian weights
+                # IMPORTANT: Only accumulate weights for pixels INSIDE the image
                 if overlap > 0:
                     tile_weights = self.get_weight(w, h)
-                    self.weights[bbox.slicer] += tile_weights
+
+                    # Calculate the intersection of the tile with the image
+                    x_start = max(0, x)
+                    y_start = max(0, y)
+                    x_end = min(self.w, x + w)
+                    y_end = min(self.h, y + h)
+
+                    # Offset into the tile weights tensor
+                    tile_x_offset = x_start - x
+                    tile_y_offset = y_start - y
+                    tile_x_end_offset = tile_x_offset + (x_end - x_start)
+                    tile_y_end_offset = tile_y_offset + (y_end - y_start)
+
+                    # Only accumulate weights for the portion of the tile that's inside the image
+                    if x_end > x_start and y_end > y_start:
+                        self.weights[:, :, y_start:y_end, x_start:x_end] += \
+                            tile_weights[tile_y_offset:tile_y_end_offset, tile_x_offset:tile_x_end_offset]
                 else:
-                    # For non-overlap mode, just count coverage (but we use direct assignment anyway)
-                    self.weights[bbox.slicer] += self.get_tile_weights()
+                    # For non-overlap mode, just count coverage
+                    # Only count pixels inside the image
+                    x_start = max(0, x)
+                    y_start = max(0, y)
+                    x_end = min(self.w, x + w)
+                    y_end = min(self.h, y + h)
+                    if x_end > x_start and y_end > y_start:
+                        self.weights[:, :, y_start:y_end, x_start:x_end] += self.get_tile_weights()
 
             bboxes = bbox_list
             leaves = visualizer_quadtree['leaves']
@@ -1018,20 +1080,20 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # batching
                 x_tile_list     = []
 
-                # For quadtree with overlap, tiles in same batch may have slightly different sizes
-                # due to border clamping. We need to pad them to the same size for concatenation.
-                if use_qt and len(bboxes) > 1:
-                    # Find maximum size in this batch
+                # For quadtree with overlap, extract tiles with padding if needed
+                if use_qt:
+                    # Find maximum size in this batch (should all be same if square tiles work correctly)
                     max_h = max(bbox.h for bbox in bboxes)
                     max_w = max(bbox.w for bbox in bboxes)
 
                     for bbox in bboxes:
-                        tile = x_in[bbox.slicer]
-                        # Pad if needed
+                        # Use helper function to extract with reflection padding
+                        tile = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+
+                        # Additional padding if tiles in batch have different sizes (shouldn't happen with square tiles)
                         if tile.shape[-2] < max_h or tile.shape[-1] < max_w:
                             pad_h = max_h - tile.shape[-2]
                             pad_w = max_w - tile.shape[-1]
-                            # Pad: (left, right, top, bottom)
                             tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h), mode='replicate')
                         x_tile_list.append(tile)
                 else:
@@ -1107,22 +1169,41 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                 # Tile not yet active - preserve input instead of using model output
                                 # Blend: early in schedule, use more input; later, transition to output
                                 blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
-                                tile_input = x_in[bbox.slicer]
+                                tile_input = extract_tile_with_padding(x_in, bbox, self.w, self.h)
                                 tile_out = tile_input * (1 - blend_factor) + tile_out * blend_factor
 
                     if use_qt:
-                        # In quadtree mode
+                        # In quadtree mode with square tiles
+                        # Calculate intersection with image boundaries
+                        x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+                        x_start = max(0, x)
+                        y_start = max(0, y)
+                        x_end = min(self.w, x + w)
+                        y_end = min(self.h, y + h)
+
+                        # Calculate offset into tile (accounts for padding we added earlier)
+                        tile_x_offset = x_start - x
+                        tile_y_offset = y_start - y
+
+                        # Extract the valid portion of the tile (without padding)
+                        valid_tile = tile_out[:, :,
+                                              tile_y_offset:tile_y_offset + (y_end - y_start),
+                                              tile_x_offset:tile_x_offset + (x_end - x_start)]
+
                         if self.tile_overlap > 0:
                             # With overlap enabled, use weighted blending
-                            # Generate Gaussian weights for this specific tile size
-                            tile_weights = self.get_weight(bbox.w, bbox.h)
+                            # Generate Gaussian weights for the FULL tile size (including padding)
+                            tile_weights_full = self.get_weight(bbox.w, bbox.h)
+                            # Extract only the weights for the valid (non-padded) portion
+                            tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                            tile_x_offset:tile_x_offset + (x_end - x_start)]
                             # Reshape to [1, 1, H, W] for proper broadcasting with 4D tensors
                             tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
                             # Add weighted tile to buffer - normalization will happen after all tiles are processed
-                            self.x_buffer[bbox.slicer] += tile_out * tile_weights
+                            self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_tile * tile_weights
                         else:
-                            # Without overlap, tiles don't overlap - use simple direct assignment
-                            self.x_buffer[bbox.slicer] = tile_out
+                            # Without overlap, use simple direct assignment
+                            self.x_buffer[:, :, y_start:y_end, x_start:x_end] = valid_tile
                     else:
                         # In grid mode, tiles overlap - use weighted blending
                         # These weights can be calcluated in advance, but will cost a lot of vram

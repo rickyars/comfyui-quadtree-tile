@@ -235,13 +235,19 @@ class QuadtreeBuilder:
             else:
                 _, h, w = tensor.shape
 
-            # Ensure root dimensions are aligned to 8-pixel boundaries
-            # This is critical for VAE encoder/decoder compatibility
-            w_aligned = (w // 8) * 8
-            h_aligned = (h // 8) * 8
+            # APPROACH A: Create SQUARE root covering entire image
+            # This ensures all children will be square (quadtree property)
+            root_size = max(w, h)
 
-            # Root node matches the actual image dimensions (can be rectangular)
-            root_node = QuadtreeNode(0, 0, w_aligned, h_aligned, 0)
+            # Ensure root size is aligned to 16-pixel boundaries
+            # WHY 16: VAE needs 8x (divisible by 8), but square subdivision requires 16x
+            # Square subdivision: parent N splits to children N/2 and N/2
+            # For squares: N/2 must equal N - N/2, so N must be divisible by 16
+            root_size = ((root_size + 15) // 16) * 16
+
+            # Create square root node at origin (0, 0)
+            # This square will cover the entire image and extend beyond if needed
+            root_node = QuadtreeNode(0, 0, root_size, root_size, 0)
 
         # Calculate variance for this node
         variance = self.calculate_variance(tensor, root_node.x, root_node.y, root_node.w, root_node.h)
@@ -319,6 +325,39 @@ class QuadtreeBuilder:
 
         # Get leaf nodes
         leaves = self.get_leaf_nodes(root)
+
+        # Get actual image dimensions
+        if tensor.dim() == 4:
+            _, _, image_h, image_w = tensor.shape
+        else:
+            _, image_h, image_w = tensor.shape
+
+        # FILTER OUT-OF-BOUNDS LEAVES (Bug #2 Fix)
+        # Remove leaves that are completely outside the image bounds
+        # This prevents empty tensor extraction and padding failures
+        original_leaf_count = len(leaves)
+        leaves = [leaf for leaf in leaves
+                  if not (leaf.x >= image_w or leaf.y >= image_h or
+                          leaf.x + leaf.w <= 0 or leaf.y + leaf.h <= 0)]
+
+        if len(leaves) < original_leaf_count:
+            filtered_count = original_leaf_count - len(leaves)
+            print(f'[Quadtree Builder]: Filtered {filtered_count} out-of-bounds leaves')
+
+        # CRITICAL VALIDATION: Ensure all leaves are square
+        # This is required for Approach A to work correctly
+        non_square_leaves = []
+        for leaf in leaves:
+            if leaf.w != leaf.h:
+                non_square_leaves.append((leaf.x, leaf.y, leaf.w, leaf.h))
+
+        if non_square_leaves:
+            error_msg = f"Found {len(non_square_leaves)} non-square leaves:\n"
+            for x, y, w, h in non_square_leaves[:5]:  # Show first 5
+                error_msg += f"  - Position ({x}, {y}): {w}x{h}\n"
+            raise AssertionError(error_msg)
+
+        print(f'[Quadtree Builder]: ✓ All {len(leaves)} leaf nodes are square')
 
         return root, leaves
 
@@ -952,8 +991,29 @@ class VAEHook:
         # Prepare tiles by split the input latents
         tiles = []
         for input_bbox in in_bboxes:
-            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]].cpu()
-            tiles.append(tile)
+            # Extract tile with clamping to image boundaries
+            x1, x2, y1, y2 = input_bbox
+            x1_clamped = max(0, x1)
+            x2_clamped = min(width, x2)
+            y1_clamped = max(0, y1)
+            y2_clamped = min(height, y2)
+
+            # Extract the available region
+            tile = z[:, :, y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+
+            # Check if padding is needed (tile extends beyond image)
+            pad_left = max(0, -x1)
+            pad_right = max(0, x2 - width)
+            pad_top = max(0, -y1)
+            pad_bottom = max(0, y2 - height)
+
+            # Apply reflection padding if needed
+            if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+                # PyTorch pad order: (left, right, top, bottom)
+                tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+                print(f'[Quadtree VAE]: Padded tile at ({x1},{y1}) with padding (L:{pad_left}, R:{pad_right}, T:{pad_top}, B:{pad_bottom})')
+
+            tiles.append(tile.cpu())
 
         num_tiles = len(tiles)
         num_completed = 0
