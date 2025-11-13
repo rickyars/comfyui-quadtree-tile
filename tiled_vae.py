@@ -326,24 +326,6 @@ class QuadtreeBuilder:
         # Get leaf nodes
         leaves = self.get_leaf_nodes(root)
 
-        # Get actual image dimensions
-        if tensor.dim() == 4:
-            _, _, image_h, image_w = tensor.shape
-        else:
-            _, image_h, image_w = tensor.shape
-
-        # FILTER OUT-OF-BOUNDS LEAVES (Bug #2 Fix)
-        # Remove leaves that are completely outside the image bounds
-        # This prevents empty tensor extraction and padding failures
-        original_leaf_count = len(leaves)
-        leaves = [leaf for leaf in leaves
-                  if not (leaf.x >= image_w or leaf.y >= image_h or
-                          leaf.x + leaf.w <= 0 or leaf.y + leaf.h <= 0)]
-
-        if len(leaves) < original_leaf_count:
-            filtered_count = original_leaf_count - len(leaves)
-            print(f'[Quadtree Builder]: Filtered {filtered_count} out-of-bounds leaves')
-
         # CRITICAL VALIDATION: Ensure all leaves are square
         # This is required for Approach A to work correctly
         non_square_leaves = []
@@ -1272,10 +1254,10 @@ class QuadtreeVisualizer:
                 "image": ("IMAGE",),
                 "content_threshold": ("FLOAT", {
                     "default": 0.05,
-                    "min": 0.001,
+                    "min": 0.01,
                     "max": 0.5,
-                    "step": 0.001,
-                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas. Try 0.01-0.05 for balanced, 0.001-0.01 for aggressive subdivision, 0.1+ for minimal subdivision."
+                    "step": 0.01,
+                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas. Try 0.01-0.05 for balanced, 0.05-0.1 for conservative subdivision, 0.1+ for minimal subdivision."
                 }),
                 "max_depth": ("INT", {
                     "default": 5,
