@@ -1286,6 +1286,12 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                 # Blend: early in schedule, use more input; later, transition to output
                                 blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
                                 tile_input = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+
+                                # CRITICAL FIX: Crop tile_input to match tile_out size
+                                # tile_out is cropped to bbox dimensions, but tile_input includes padding
+                                if tile_input.shape[-2:] != tile_out.shape[-2:]:
+                                    tile_input = tile_input[:, :, :tile_out.shape[-2], :tile_out.shape[-1]]
+
                                 tile_out = tile_input * (1 - blend_factor) + tile_out * blend_factor
 
                     if use_qt:
