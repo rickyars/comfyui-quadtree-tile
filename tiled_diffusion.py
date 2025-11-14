@@ -377,9 +377,16 @@ class AbstractDiffusion:
             # Remove leaves that are completely outside the latent image bounds
             # This prevents coverage gaps and empty tensor extraction
             original_leaf_count = len(leaves)
+            # Filter out-of-bounds leaves, accounting for overlap that will be added later (lines 397-400)
+            # A leaf should be KEPT if its tile (after adding overlap) overlaps with the image
+            # Tile position after overlap: (leaf.x // 8 - overlap, leaf.y // 8 - overlap)
+            # Tile end after overlap: (leaf.x // 8 + leaf.w // 8 + overlap, leaf.y // 8 + leaf.h // 8 + overlap)
+            # Keep if: tile_start < image_dimension AND tile_end > 0
             leaves = [leaf for leaf in leaves
-                      if not (leaf.x // 8 >= self.w or leaf.y // 8 >= self.h or
-                              (leaf.x + leaf.w) // 8 <= 0 or (leaf.y + leaf.h) // 8 <= 0)]
+                      if not ((leaf.x // 8 - overlap) >= self.w or
+                              (leaf.y // 8 - overlap) >= self.h or
+                              (leaf.x // 8 + leaf.w // 8 + overlap) <= 0 or
+                              (leaf.y // 8 + leaf.h // 8 + overlap) <= 0)]
 
             if len(leaves) < original_leaf_count:
                 filtered_count = original_leaf_count - len(leaves)
