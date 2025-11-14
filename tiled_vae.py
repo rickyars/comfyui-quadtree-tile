@@ -989,10 +989,24 @@ class VAEHook:
             pad_top = max(0, -y1)
             pad_bottom = max(0, y2 - height)
 
-            # Apply reflection padding if needed
+            # Apply padding if needed
             if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
                 # PyTorch pad order: (left, right, top, bottom)
-                tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+
+                # Reflection padding has a limit: padding must be < dimension size
+                # For tiles that extend far beyond image, use replicate mode instead
+                _, _, tile_h, tile_w = tile.shape
+
+                # Check if reflection padding is possible
+                can_reflect_h = (pad_top < tile_h) and (pad_bottom < tile_h)
+                can_reflect_w = (pad_left < tile_w) and (pad_right < tile_w)
+
+                if can_reflect_h and can_reflect_w:
+                    # Use reflection for smoother boundaries
+                    tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+                else:
+                    # Fall back to replicate for tiles extending far beyond image
+                    tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
                 print(f'[Quadtree VAE]: Padded tile at ({x1},{y1}) with padding (L:{pad_left}, R:{pad_right}, T:{pad_top}, B:{pad_bottom})')
 
             tiles.append(tile.cpu())
