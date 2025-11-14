@@ -377,23 +377,75 @@ class AbstractDiffusion:
             # Remove leaves that are completely outside the latent image bounds
             # This prevents coverage gaps and empty tensor extraction
             original_leaf_count = len(leaves)
+
+            # DEBUG: Print dimensions and overlap
+            print(f'[Quadtree Diffusion DEBUG]: Image dimensions: {self.w}x{self.h} latent, overlap={overlap}')
+
             # Filter out-of-bounds leaves, accounting for overlap that will be added later (lines 397-400)
             # A leaf should be KEPT if its tile (after adding overlap) overlaps with the image
             # Tile position after overlap: (leaf.x // 8 - overlap, leaf.y // 8 - overlap)
             # Tile end after overlap: (leaf.x // 8 + leaf.w // 8 + overlap, leaf.y // 8 + leaf.h // 8 + overlap)
             # Keep if: tile_start < image_dimension AND tile_end > 0
-            leaves = [leaf for leaf in leaves
-                      if not ((leaf.x // 8 - overlap) >= self.w or
-                              (leaf.y // 8 - overlap) >= self.h or
-                              (leaf.x // 8 + leaf.w // 8 + overlap) <= 0 or
-                              (leaf.y // 8 + leaf.h // 8 + overlap) <= 0)]
 
-            if len(leaves) < original_leaf_count:
-                filtered_count = original_leaf_count - len(leaves)
-                print(f'[Quadtree Diffusion]: Filtered {filtered_count} out-of-bounds leaves (using runtime dimensions {self.w}x{self.h} latent)')
+            filtered_leaves = []
+            kept_leaves = []
+            for leaf in leaves:
+                # Calculate CORE bounds (without overlap) in latent space
+                core_start_x = leaf.x // 8
+                core_start_y = leaf.y // 8
+                core_end_x = leaf.x // 8 + leaf.w // 8
+                core_end_y = leaf.y // 8 + leaf.h // 8
+
+                # Calculate tile bounds with overlap
+                tile_start_x = core_start_x - overlap
+                tile_start_y = core_start_y - overlap
+                tile_end_x = core_end_x + overlap
+                tile_end_y = core_end_y + overlap
+
+                # CRITICAL FIX: Filter based on core position, not just tile position
+                # The quadtree creates a square root that extends beyond the image, generating
+                # leaves outside the actual image bounds. We must filter these properly.
+                #
+                # Filter if:
+                # 1. Core is completely outside the image (core doesn't intersect image bounds), OR
+                # 2. Tile (with overlap) doesn't intersect the image at all
+                #
+                # Why check core? Because Gaussian weights are centered on the core. If the core
+                # is entirely outside, the weights for boundary pixels will be near-zero.
+                core_outside_x = core_start_x >= self.w or core_end_x <= 0
+                core_outside_y = core_start_y >= self.h or core_end_y <= 0
+
+                # Also filter if tile doesn't overlap at all (safety check)
+                tile_no_overlap_x = tile_start_x >= self.w or tile_end_x <= 0
+                tile_no_overlap_y = tile_start_y >= self.h or tile_end_y <= 0
+
+                should_filter = core_outside_x or core_outside_y or tile_no_overlap_x or tile_no_overlap_y
+
+                if should_filter:
+                    filtered_leaves.append(leaf)
+                    # Concise debug output
+                    reasons = []
+                    if core_outside_x:
+                        reasons.append(f"core X outside")
+                    if core_outside_y:
+                        reasons.append(f"core Y outside")
+                    if tile_no_overlap_x and not core_outside_x:
+                        reasons.append(f"tile X no overlap")
+                    if tile_no_overlap_y and not core_outside_y:
+                        reasons.append(f"tile Y no overlap")
+                    print(f'[DEBUG] Filtered leaf: core_latent=({core_start_x},{core_start_y},{core_end_x-core_start_x},{core_end_y-core_start_y}) reason=[{", ".join(reasons)}]')
+                else:
+                    kept_leaves.append(leaf)
+
+            leaves = kept_leaves
+
+            if len(filtered_leaves) > 0:
+                print(f'[Quadtree Diffusion]: Filtered {len(filtered_leaves)} out-of-bounds leaves (using runtime dimensions {self.w}x{self.h} latent)')
 
             bbox_list = []
-            for leaf in leaves:
+            print(f'[Quadtree Diffusion DEBUG]: Processing {len(leaves)} kept leaves')
+            boundary_leaves = 0
+            for idx, leaf in enumerate(leaves):
                 # Scale from image space to latent space (divide by 8)
                 core_x, core_y = leaf.x // 8, leaf.y // 8
                 core_w, core_h = leaf.w // 8, leaf.h // 8
@@ -405,6 +457,10 @@ class AbstractDiffusion:
                 y = core_y - overlap
                 w = core_w + 2 * overlap
                 h = core_h + 2 * overlap
+
+                # DEBUG: Count leaves near boundaries
+                if core_x + core_w >= self.w - 20 or core_y + core_h >= self.h - 20:
+                    boundary_leaves += 1
 
                 # Tiles MUST remain square (w == h) for Approach A
                 assert w == h, f"Tile not square after overlap: {w}x{h} at ({x},{y})"
@@ -446,6 +502,8 @@ class AbstractDiffusion:
                     if x_end > x_start and y_end > y_start:
                         self.weights[:, :, y_start:y_end, x_start:x_end] += self.get_tile_weights()
 
+            print(f'[Quadtree Diffusion DEBUG]: {boundary_leaves} leaves near image boundaries')
+
             bboxes = bbox_list
             leaves = visualizer_quadtree['leaves']
         else:
@@ -455,6 +513,26 @@ class AbstractDiffusion:
         # Validate full coverage
         if self.weights.min() < 1e-6:
             uncovered = (self.weights < 1e-6).sum().item()
+            # DEBUG: Find where uncovered pixels are
+            uncovered_mask = (self.weights[0, 0] < 1e-6)
+            uncovered_coords = torch.nonzero(uncovered_mask, as_tuple=False)
+            if len(uncovered_coords) > 0:
+                # Show first and last few uncovered pixels
+                print(f'[DEBUG] UNCOVERED PIXELS ({uncovered} total):')
+                print(f'        Image dims: {self.w}x{self.h} latent')
+                print(f'        First uncovered pixels (y, x):')
+                for i in range(min(10, len(uncovered_coords))):
+                    y, x = uncovered_coords[i]
+                    print(f'          ({y.item()}, {x.item()})')
+                if len(uncovered_coords) > 10:
+                    print(f'        Last uncovered pixels (y, x):')
+                    for i in range(max(0, len(uncovered_coords) - 5), len(uncovered_coords)):
+                        y, x = uncovered_coords[i]
+                        print(f'          ({y.item()}, {x.item()})')
+                # Find bounding box of uncovered region
+                y_coords = uncovered_coords[:, 0]
+                x_coords = uncovered_coords[:, 1]
+                print(f'        Uncovered region bounds: y=[{y_coords.min().item()}, {y_coords.max().item()}], x=[{x_coords.min().item()}, {x_coords.max().item()}]')
             raise RuntimeError(f"Quadtree has {uncovered} uncovered pixels! Bug in quadtree implementation.")
 
         self.quadtree_leaves = leaves  # Store for potential later use
