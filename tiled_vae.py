@@ -100,7 +100,14 @@ class QuadtreeNode:
         return len(self.children) == 0
 
     def subdivide(self):
-        """Subdivide this node into 4 children with 8-pixel alignment for VAE compatibility"""
+        """Subdivide this node into 4 children with 8-pixel alignment for VAE compatibility
+
+        Strategy:
+        - Always create exactly 4 children (quadtree property)
+        - Rectangular parents → 4 rectangular children
+        - Children naturally become smaller as we subdivide deeper
+        - Stop at leaf level (min_tile_size or max_depth)
+        """
         # Ensure subdivisions are aligned to 8-pixel boundaries for VAE encoder/decoder
         # VAE downsamples by 8x, so tiles must be divisible by 8
         half_w = (self.w // 2) // 8 * 8  # Round down to nearest multiple of 8
@@ -110,7 +117,9 @@ class QuadtreeNode:
         half_w = max(half_w, 8)
         half_h = max(half_h, 8)
 
-        # Create 4 child nodes (top-left, top-right, bottom-left, bottom-right)
+        # QUADTREE PROPERTY: Always create exactly 4 children
+        # Children inherit parent's proportions and become smaller as we subdivide deeper
+
         self.children = [
             QuadtreeNode(self.x, self.y, half_w, half_h, self.depth + 1),  # Top-left
             QuadtreeNode(self.x + half_w, self.y, self.w - half_w, half_h, self.depth + 1),  # Top-right
@@ -226,12 +235,19 @@ class QuadtreeBuilder:
             else:
                 _, h, w = tensor.shape
 
-            # Ensure root dimensions are aligned to 8-pixel boundaries
-            # This is critical for VAE encoder/decoder compatibility
-            w_aligned = (w // 8) * 8
-            h_aligned = (h // 8) * 8
+            # APPROACH A: Create SQUARE root covering entire image
+            # This ensures all children will be square (quadtree property)
+            root_size = max(w, h)
 
-            root_node = QuadtreeNode(0, 0, w_aligned, h_aligned, 0)
+            # Ensure root size is aligned to 16-pixel boundaries
+            # WHY 16: VAE needs 8x (divisible by 8), but square subdivision requires 16x
+            # Square subdivision: parent N splits to children N/2 and N/2
+            # For squares: N/2 must equal N - N/2, so N must be divisible by 16
+            root_size = ((root_size + 15) // 16) * 16
+
+            # Create square root node at origin (0, 0)
+            # This square will cover the entire image and extend beyond if needed
+            root_node = QuadtreeNode(0, 0, root_size, root_size, 0)
 
         # Calculate variance for this node
         variance = self.calculate_variance(tensor, root_node.x, root_node.y, root_node.w, root_node.h)
@@ -309,6 +325,21 @@ class QuadtreeBuilder:
 
         # Get leaf nodes
         leaves = self.get_leaf_nodes(root)
+
+        # CRITICAL VALIDATION: Ensure all leaves are square
+        # This is required for Approach A to work correctly
+        non_square_leaves = []
+        for leaf in leaves:
+            if leaf.w != leaf.h:
+                non_square_leaves.append((leaf.x, leaf.y, leaf.w, leaf.h))
+
+        if non_square_leaves:
+            error_msg = f"Found {len(non_square_leaves)} non-square leaves:\n"
+            for x, y, w, h in non_square_leaves[:5]:  # Show first 5
+                error_msg += f"  - Position ({x}, {y}): {w}x{h}\n"
+            raise AssertionError(error_msg)
+
+        print(f'[Quadtree Builder]: ✓ All {len(leaves)} leaf nodes are square')
 
         return root, leaves
 
@@ -942,8 +973,43 @@ class VAEHook:
         # Prepare tiles by split the input latents
         tiles = []
         for input_bbox in in_bboxes:
-            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]].cpu()
-            tiles.append(tile)
+            # Extract tile with clamping to image boundaries
+            x1, x2, y1, y2 = input_bbox
+            x1_clamped = max(0, x1)
+            x2_clamped = min(width, x2)
+            y1_clamped = max(0, y1)
+            y2_clamped = min(height, y2)
+
+            # Extract the available region
+            tile = z[:, :, y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+
+            # Check if padding is needed (tile extends beyond image)
+            pad_left = max(0, -x1)
+            pad_right = max(0, x2 - width)
+            pad_top = max(0, -y1)
+            pad_bottom = max(0, y2 - height)
+
+            # Apply padding if needed
+            if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+                # PyTorch pad order: (left, right, top, bottom)
+
+                # Reflection padding has a limit: padding must be < dimension size
+                # For tiles that extend far beyond image, use replicate mode instead
+                _, _, tile_h, tile_w = tile.shape
+
+                # Check if reflection padding is possible
+                can_reflect_h = (pad_top < tile_h) and (pad_bottom < tile_h)
+                can_reflect_w = (pad_left < tile_w) and (pad_right < tile_w)
+
+                if can_reflect_h and can_reflect_w:
+                    # Use reflection for smoother boundaries
+                    tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+                else:
+                    # Fall back to replicate for tiles extending far beyond image
+                    tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
+                print(f'[Quadtree VAE]: Padded tile at ({x1},{y1}) with padding (L:{pad_left}, R:{pad_right}, T:{pad_top}, B:{pad_bottom})')
+
+            tiles.append(tile.cpu())
 
         num_tiles = len(tiles)
         num_completed = 0
@@ -1200,11 +1266,41 @@ class QuadtreeVisualizer:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "content_threshold": ("FLOAT", {"default": 0.05, "min": 0.005, "max": 0.25, "step": 0.005}),
-                "max_depth": ("INT", {"default": 4, "min": 1, "max": 8, "step": 1}),
-                "min_tile_size": ("INT", {"default": 512, "min": 96, "max": 1024, "step": 16, "tooltip": "Minimum tile size in pixels (image space). Recommended: 512-768px for diffusion. Smaller values create more tiles but may be slower."}),
-                "min_denoise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "max_denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "content_threshold": ("FLOAT", {
+                    "default": 0.05,
+                    "min": 0.01,
+                    "max": 0.5,
+                    "step": 0.01,
+                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas. Try 0.01-0.05 for balanced, 0.05-0.1 for conservative subdivision, 0.1+ for minimal subdivision."
+                }),
+                "max_depth": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "tooltip": "Maximum subdivision depth. Higher = smaller minimum tiles. 5 = up to 32x32 grid, 6 = 64x64 grid"
+                }),
+                "min_tile_size": ("INT", {
+                    "default": 256,
+                    "min": 64,
+                    "max": 2048,
+                    "step": 16,
+                    "tooltip": "Minimum tile size in pixels (image space). 256-512px recommended for most cases. Smaller = more tiles but slower."
+                }),
+                "min_denoise": ("FLOAT", {
+                    "default": 0.2,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Denoise strength for largest tiles (low complexity areas). 0.0 = preserve completely, 1.0 = regenerate completely"
+                }),
+                "max_denoise": ("FLOAT", {
+                    "default": 0.8,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "Denoise strength for smallest tiles (high complexity areas). Should be >= min_denoise"
+                }),
                 "line_thickness": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
             }
         }

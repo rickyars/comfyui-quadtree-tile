@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from typing import List, Union, Tuple, Callable, Dict
 from weakref import WeakSet
+from collections import defaultdict
 import comfy.utils
 import comfy.model_patcher
 import comfy.model_management
@@ -68,6 +69,58 @@ def repeat_to_batch_size(tensor, batch_size, dim=0):
         return tensor.repeat(dim * [1] + [ceildiv(batch_size, tensor.shape[dim])] + [1] * (len(tensor.shape) - 1 - dim)).narrow(dim, 0, batch_size)
     return tensor
 
+def extract_tile_with_padding(tensor: Tensor, bbox: BBox, image_w: int, image_h: int) -> Tensor:
+    """
+    Extract a tile from tensor with reflection padding if it extends beyond boundaries
+
+    Args:
+        tensor: Input tensor (B, C, H, W)
+        bbox: BBox defining the tile region (may extend beyond tensor)
+        image_w: Actual image width
+        image_h: Actual image height
+
+    Returns:
+        Extracted tile with padding applied if needed
+    """
+    x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+
+    # Calculate clamped extraction region (what we can actually extract)
+    x_start = max(0, x)
+    y_start = max(0, y)
+    x_end = min(image_w, x + w)
+    y_end = min(image_h, y + h)
+
+    # Extract the available region
+    tile = tensor[:, :, y_start:y_end, x_start:x_end]
+
+    # Calculate padding needed
+    pad_left = max(0, -x)
+    pad_right = max(0, (x + w) - image_w)
+    pad_top = max(0, -y)
+    pad_bottom = max(0, (y + h) - image_h)
+
+    # Apply padding if needed
+    if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+        import torch.nn.functional as F
+        # PyTorch pad order: (left, right, top, bottom)
+
+        # Reflection padding has a limit: padding must be < dimension size
+        # For tiles that extend far beyond image, use replicate mode instead
+        _, _, tile_h, tile_w = tile.shape
+
+        # Check if reflection padding is possible
+        can_reflect_h = (pad_top < tile_h) and (pad_bottom < tile_h)
+        can_reflect_w = (pad_left < tile_w) and (pad_right < tile_w)
+
+        if can_reflect_h and can_reflect_w:
+            # Use reflection for smoother boundaries
+            tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+        else:
+            # Fall back to replicate for tiles extending far beyond image
+            tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
+
+    return tile
+
 def split_bboxes(w:int, h:int, tile_w:int, tile_h:int, overlap:int=16, init_weight:Union[Tensor, float]=1.0) -> Tuple[List[BBox], Tensor]:
     cols = ceildiv((w - overlap) , (tile_w - overlap))
     rows = ceildiv((h - overlap) , (tile_h - overlap))
@@ -122,8 +175,21 @@ def split_bboxes_quadtree(w: int, h: int, content_threshold: float, max_depth: i
     weight = torch.zeros((1, 1, h, w), device=device, dtype=torch.float32)
 
     for leaf in leaves:
-        # Create BBox from leaf node
-        bbox = BBox(leaf.x, leaf.y, leaf.w, leaf.h)
+        # Clamp tile to actual image bounds (since root may be larger square)
+        tile_x = min(leaf.x, w - 1)
+        tile_y = min(leaf.y, h - 1)
+        tile_w = min(leaf.w, w - tile_x)
+        tile_h = min(leaf.h, h - tile_y)
+
+        # Skip tiles that are completely outside the image or too small
+        if tile_w <= 0 or tile_h <= 0 or tile_x >= w or tile_y >= h:
+            continue
+
+        # For true quadtree, ensure tile remains square after clamping
+        tile_size = min(tile_w, tile_h)
+
+        # Create BBox from clamped dimensions
+        bbox = BBox(tile_x, tile_y, tile_size, tile_size)
 
         # Store denoise value in bbox for later use
         bbox.denoise = leaf.denoise
@@ -158,6 +224,8 @@ class AbstractDiffusion:
         self.method = self.__class__.__name__
         self.pbar = None
 
+        # Performance: Cache for Gaussian weights to avoid recomputation
+        self.gaussian_weight_cache = {}
 
         self.w: int = 0
         self.h: int = 0
@@ -308,31 +376,108 @@ class AbstractDiffusion:
             if num_leaves > 100:
                 print(f'[Quadtree Diffusion]: ⚠️  {num_leaves} tiles may be slow. Consider increasing min_tile_size to 512-768px.')
 
-            # Warning for overlap >= smallest tile
+            # Warning for overlap >= smallest tile dimension
             if overlap > 0:
-                min_tile_size = min(leaf.w * leaf.h for leaf in visualizer_quadtree["leaves"])
-                min_tile_dim = int(min_tile_size ** 0.5) // 8
+                # Find smallest tile dimension (not area) in latent space
+                min_tile_dim = min(min(leaf.w, leaf.h) for leaf in visualizer_quadtree["leaves"]) // 8
                 if overlap >= min_tile_dim:
-                    print(f'[Quadtree Diffusion]: ⚠️  Overlap ({overlap}px) >= smallest tile (~{min_tile_dim}px). Reduce overlap or increase min_tile_size.')
+                    print(f'[Quadtree Diffusion]: ⚠️  Overlap ({overlap}px latent) >= smallest tile dimension ({min_tile_dim}px latent = {min_tile_dim*8}px image). Reduce overlap or increase min_tile_size in visualizer.')
 
             # Reuse the quadtree structure from Visualizer
             # Note: Visualizer operates in image space (8x larger), so we need to scale coordinates
             leaves = visualizer_quadtree['leaves']
-            bbox_list = []
+
+            # FILTER OUT-OF-BOUNDS LEAVES using actual runtime dimensions
+            # Remove leaves that are completely outside the latent image bounds
+            # This prevents coverage gaps and empty tensor extraction
+            original_leaf_count = len(leaves)
+
+            # DEBUG: Print dimensions and overlap
+            print(f'[Quadtree Diffusion DEBUG]: Image dimensions: {self.w}x{self.h} latent, overlap={overlap}')
+
+            # Filter out-of-bounds leaves, accounting for overlap that will be added later (lines 397-400)
+            # A leaf should be KEPT if its tile (after adding overlap) overlaps with the image
+            # Tile position after overlap: (leaf.x // 8 - overlap, leaf.y // 8 - overlap)
+            # Tile end after overlap: (leaf.x // 8 + leaf.w // 8 + overlap, leaf.y // 8 + leaf.h // 8 + overlap)
+            # Keep if: tile_start < image_dimension AND tile_end > 0
+
+            filtered_leaves = []
+            kept_leaves = []
             for leaf in leaves:
+                # Calculate CORE bounds (without overlap) in latent space
+                core_start_x = leaf.x // 8
+                core_start_y = leaf.y // 8
+                core_end_x = leaf.x // 8 + leaf.w // 8
+                core_end_y = leaf.y // 8 + leaf.h // 8
+
+                # Calculate tile bounds with overlap
+                tile_start_x = core_start_x - overlap
+                tile_start_y = core_start_y - overlap
+                tile_end_x = core_end_x + overlap
+                tile_end_y = core_end_y + overlap
+
+                # CRITICAL FIX: Filter based on core position, not just tile position
+                # The quadtree creates a square root that extends beyond the image, generating
+                # leaves outside the actual image bounds. We must filter these properly.
+                #
+                # Filter if:
+                # 1. Core is completely outside the image (core doesn't intersect image bounds), OR
+                # 2. Tile (with overlap) doesn't intersect the image at all
+                #
+                # Why check core? Because Gaussian weights are centered on the core. If the core
+                # is entirely outside, the weights for boundary pixels will be near-zero.
+                core_outside_x = core_start_x >= self.w or core_end_x <= 0
+                core_outside_y = core_start_y >= self.h or core_end_y <= 0
+
+                # Also filter if tile doesn't overlap at all (safety check)
+                tile_no_overlap_x = tile_start_x >= self.w or tile_end_x <= 0
+                tile_no_overlap_y = tile_start_y >= self.h or tile_end_y <= 0
+
+                should_filter = core_outside_x or core_outside_y or tile_no_overlap_x or tile_no_overlap_y
+
+                if should_filter:
+                    filtered_leaves.append(leaf)
+                    # Concise debug output
+                    reasons = []
+                    if core_outside_x:
+                        reasons.append(f"core X outside")
+                    if core_outside_y:
+                        reasons.append(f"core Y outside")
+                    if tile_no_overlap_x and not core_outside_x:
+                        reasons.append(f"tile X no overlap")
+                    if tile_no_overlap_y and not core_outside_y:
+                        reasons.append(f"tile Y no overlap")
+                    print(f'[DEBUG] Filtered leaf: core_latent=({core_start_x},{core_start_y},{core_end_x-core_start_x},{core_end_y-core_start_y}) reason=[{", ".join(reasons)}]')
+                else:
+                    kept_leaves.append(leaf)
+
+            leaves = kept_leaves
+
+            if len(filtered_leaves) > 0:
+                print(f'[Quadtree Diffusion]: Filtered {len(filtered_leaves)} out-of-bounds leaves (using runtime dimensions {self.w}x{self.h} latent)')
+
+            bbox_list = []
+            print(f'[Quadtree Diffusion DEBUG]: Processing {len(leaves)} kept leaves')
+            boundary_leaves = 0
+            for idx, leaf in enumerate(leaves):
                 # Scale from image space to latent space (divide by 8)
                 core_x, core_y = leaf.x // 8, leaf.y // 8
                 core_w, core_h = leaf.w // 8, leaf.h // 8
 
-                # Expand by overlap, clamping to image boundaries
-                # This is simple: add overlap on all sides, clamp to [0, width/height]
-                x = max(0, core_x - overlap)
-                y = max(0, core_y - overlap)
-                x2 = min(self.w, core_x + core_w + overlap)
-                y2 = min(self.h, core_y + core_h + overlap)
+                # CRITICAL: Keep tiles SQUARE even with overlap
+                # Don't clamp to image boundaries - instead, we'll pad during extraction
+                # Expand by overlap on all sides symmetrically
+                x = core_x - overlap
+                y = core_y - overlap
+                w = core_w + 2 * overlap
+                h = core_h + 2 * overlap
 
-                w = x2 - x
-                h = y2 - y
+                # DEBUG: Count leaves near boundaries
+                if core_x + core_w >= self.w - 20 or core_y + core_h >= self.h - 20:
+                    boundary_leaves += 1
+
+                # Tiles MUST remain square (w == h) for Approach A
+                assert w == h, f"Tile not square after overlap: {w}x{h} at ({x},{y})"
 
                 bbox = BBox(x, y, w, h)
                 bbox.denoise = leaf.denoise
@@ -341,12 +486,37 @@ class AbstractDiffusion:
                 bbox_list.append(bbox)
 
                 # For overlap mode, accumulate actual Gaussian weights
+                # IMPORTANT: Only accumulate weights for pixels INSIDE the image
                 if overlap > 0:
                     tile_weights = self.get_weight(w, h)
-                    self.weights[bbox.slicer] += tile_weights
+
+                    # Calculate the intersection of the tile with the image
+                    x_start = max(0, x)
+                    y_start = max(0, y)
+                    x_end = min(self.w, x + w)
+                    y_end = min(self.h, y + h)
+
+                    # Offset into the tile weights tensor
+                    tile_x_offset = x_start - x
+                    tile_y_offset = y_start - y
+                    tile_x_end_offset = tile_x_offset + (x_end - x_start)
+                    tile_y_end_offset = tile_y_offset + (y_end - y_start)
+
+                    # Only accumulate weights for the portion of the tile that's inside the image
+                    if x_end > x_start and y_end > y_start:
+                        self.weights[:, :, y_start:y_end, x_start:x_end] += \
+                            tile_weights[tile_y_offset:tile_y_end_offset, tile_x_offset:tile_x_end_offset]
                 else:
-                    # For non-overlap mode, just count coverage (but we use direct assignment anyway)
-                    self.weights[bbox.slicer] += self.get_tile_weights()
+                    # For non-overlap mode, just count coverage
+                    # Only count pixels inside the image
+                    x_start = max(0, x)
+                    y_start = max(0, y)
+                    x_end = min(self.w, x + w)
+                    y_end = min(self.h, y + h)
+                    if x_end > x_start and y_end > y_start:
+                        self.weights[:, :, y_start:y_end, x_start:x_end] += self.get_tile_weights()
+
+            print(f'[Quadtree Diffusion DEBUG]: {boundary_leaves} leaves near image boundaries')
 
             bboxes = bbox_list
             leaves = visualizer_quadtree['leaves']
@@ -354,12 +524,36 @@ class AbstractDiffusion:
             # No quadtree provided - this shouldn't happen in normal usage
             raise ValueError('[Quadtree Diffusion]: No quadtree structure provided! Connect QuadtreeVisualizer output to the quadtree input.')
 
+        # Validate full coverage
+        if self.weights.min() < 1e-6:
+            uncovered = (self.weights < 1e-6).sum().item()
+            # DEBUG: Find where uncovered pixels are
+            uncovered_mask = (self.weights[0, 0] < 1e-6)
+            uncovered_coords = torch.nonzero(uncovered_mask, as_tuple=False)
+            if len(uncovered_coords) > 0:
+                # Show first and last few uncovered pixels
+                print(f'[DEBUG] UNCOVERED PIXELS ({uncovered} total):')
+                print(f'        Image dims: {self.w}x{self.h} latent')
+                print(f'        First uncovered pixels (y, x):')
+                for i in range(min(10, len(uncovered_coords))):
+                    y, x = uncovered_coords[i]
+                    print(f'          ({y.item()}, {x.item()})')
+                if len(uncovered_coords) > 10:
+                    print(f'        Last uncovered pixels (y, x):')
+                    for i in range(max(0, len(uncovered_coords) - 5), len(uncovered_coords)):
+                        y, x = uncovered_coords[i]
+                        print(f'          ({y.item()}, {x.item()})')
+                # Find bounding box of uncovered region
+                y_coords = uncovered_coords[:, 0]
+                x_coords = uncovered_coords[:, 1]
+                print(f'        Uncovered region bounds: y=[{y_coords.min().item()}, {y_coords.max().item()}], x=[{x_coords.min().item()}, {x_coords.max().item()}]')
+            raise RuntimeError(f"Quadtree has {uncovered} uncovered pixels! Bug in quadtree implementation.")
+
         self.quadtree_leaves = leaves  # Store for potential later use
         self.num_tiles = len(bboxes)
 
         # For quadtree, batch tiles by ACTUAL size (after overlap expansion)
         # Tiles with the same actual dimensions can be batched together efficiently
-        from collections import defaultdict
 
         # Group tiles by ACTUAL size (after overlap is applied)
         # This allows PyTorch to concatenate them without padding overhead
@@ -613,10 +807,14 @@ def gaussian_weights(tile_w:int, tile_h:int) -> Tensor:
     https://github.com/albarji/mixture-of-diffusers/blob/master/mixdiff/tiling.py
     This generates gaussian weights to smooth the noise of each tile.
     This is critical for this method to work.
+
+    CRITICAL FIX: Increased var from 0.01 to 0.02 to ensure edge weights > 1e-6
+    for tiles with overlap. With var=0.01, tiles ≥68×68 had edge weights < 1e-6,
+    causing pixels to be marked as "uncovered" even though tiles were processing them.
     '''
-    f = lambda x, midpoint, var=0.01: exp(-(x-midpoint)*(x-midpoint) / (tile_w*tile_w) / (2*var)) / sqrt(2*pi*var)
+    f = lambda x, midpoint, var=0.02: exp(-(x-midpoint)*(x-midpoint) / (tile_w*tile_w) / (2*var)) / sqrt(2*pi*var)
     x_probs = [f(x, (tile_w - 1) / 2) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
-    y_probs = [f(y,  tile_h      / 2) for y in range(tile_h)]
+    y_probs = [f(y,  (tile_h - 1) / 2) for y in range(tile_h)]  # FIXED: was tile_h / 2, now consistent with x_probs
 
     w = np.outer(y_probs, x_probs)
     return torch.from_numpy(w).to(devices.device, dtype=torch.float32)
@@ -634,6 +832,9 @@ class MultiDiffusion(AbstractDiffusion):
 
         N, C, H, W = x_in.shape
 
+        # Performance: Cache use_quadtree flag once instead of multiple getattr calls
+        use_qt = getattr(self, 'use_quadtree', False)
+
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
         if self.weights is None or self.h != H or self.w != W:
@@ -641,7 +842,6 @@ class MultiDiffusion(AbstractDiffusion):
             self.refresh = True
 
             # Check if quadtree mode is enabled
-            use_qt = getattr(self, 'use_quadtree', False)
             print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
 
             if use_qt:
@@ -660,7 +860,7 @@ class MultiDiffusion(AbstractDiffusion):
         # Background sampling (grid bbox)
         if self.draw_background:
             for batch_id, bboxes in enumerate(self.batched_bboxes):
-                if processing_interrupted(): 
+                if processing_interrupted():
                     # self.pbar.close()
                     return x_in
 
@@ -699,9 +899,6 @@ class MultiDiffusion(AbstractDiffusion):
                 # self.switch_stablesr_tensors(batch_id)
 
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
-
-                # Check if we're using quadtree mode
-                use_qt = getattr(self, 'use_quadtree', False)
 
                 for i, bbox in enumerate(bboxes):
                     # Both quadtree and grid tiles use accumulation with overlap
@@ -757,6 +954,9 @@ class SpotDiffusion(AbstractDiffusion):
 
         N, C, H, W = x_in.shape
 
+        # Performance: Cache use_quadtree flag once instead of multiple getattr calls
+        use_qt = getattr(self, 'use_quadtree', False)
+
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
         if self.weights is None or self.h != H or self.w != W:
@@ -764,7 +964,6 @@ class SpotDiffusion(AbstractDiffusion):
             self.refresh = True
 
             # Check if quadtree mode is enabled
-            use_qt = getattr(self, 'use_quadtree', False)
             print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
 
             if use_qt:
@@ -901,7 +1100,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
         # weights for custom bboxes
         self.custom_weights: List[Tensor] = []
-        self.get_weight = gaussian_weights
+
+    def get_weight(self, tile_w: int, tile_h: int) -> Tensor:
+        """Generate Gaussian weight matrix for a tile with caching"""
+        cache_key = (tile_w, tile_h)
+        if cache_key in self.gaussian_weight_cache:
+            return self.gaussian_weight_cache[cache_key]
+
+        # Compute Gaussian weights using the original function
+        w = gaussian_weights(tile_w, tile_h)
+
+        # Cache before returning
+        self.gaussian_weight_cache[cache_key] = w
+        return w
 
     def init_done(self):
         super().init_done()
@@ -937,6 +1148,15 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # Check if quadtree mode is enabled (needed throughout the function)
         use_qt = getattr(self, 'use_quadtree', False)
 
+        # Store sigmas for variable denoise (from store if available)
+        if not hasattr(self, 'sigmas') or self.sigmas is None:
+            try:
+                from .utils import store
+                if hasattr(store, 'sigmas'):
+                    self.sigmas = store.sigmas
+            except:
+                pass
+
         self.refresh = False
         # self.refresh = True
         if self.weights is None or self.h != H or self.w != W:
@@ -945,6 +1165,16 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
             if use_qt:
                 self.init_quadtree_bbox(x_in, self.tile_batch_size)
+                # Print denoise range for quadtree tiles
+                if hasattr(self, 'batched_bboxes') and len(self.batched_bboxes) > 0:
+                    all_denoise = [bbox.denoise for batch in self.batched_bboxes for bbox in batch if hasattr(bbox, 'denoise')]
+                    if all_denoise:
+                        min_d, max_d = min(all_denoise), max(all_denoise)
+                        print(f'[Quadtree Variable Denoise]: Denoise range: {min_d:.3f} to {max_d:.3f}')
+                        if min_d < 1.0:
+                            print(f'[Quadtree Variable Denoise]: ENABLED - Tiles will be denoised adaptively')
+                        else:
+                            print(f'[Quadtree Variable Denoise]: All tiles at max denoise - no variation')
             else:
                 self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
 
@@ -966,20 +1196,20 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # batching
                 x_tile_list     = []
 
-                # For quadtree with overlap, tiles in same batch may have slightly different sizes
-                # due to border clamping. We need to pad them to the same size for concatenation.
-                if use_qt and len(bboxes) > 1:
-                    # Find maximum size in this batch
+                # For quadtree with overlap, extract tiles with padding if needed
+                if use_qt:
+                    # Find maximum size in this batch (should all be same if square tiles work correctly)
                     max_h = max(bbox.h for bbox in bboxes)
                     max_w = max(bbox.w for bbox in bboxes)
 
                     for bbox in bboxes:
-                        tile = x_in[bbox.slicer]
-                        # Pad if needed
+                        # Use helper function to extract with reflection padding
+                        tile = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+
+                        # Additional padding if tiles in batch have different sizes (shouldn't happen with square tiles)
                         if tile.shape[-2] < max_h or tile.shape[-1] < max_w:
                             pad_h = max_h - tile.shape[-2]
                             pad_w = max_w - tile.shape[-1]
-                            # Pad: (left, right, top, bottom)
                             tile = torch.nn.functional.pad(tile, (0, pad_w, 0, pad_h), mode='replicate')
                         x_tile_list.append(tile)
                 else:
@@ -1031,19 +1261,71 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     if tile_out.shape[-2] > bbox.h or tile_out.shape[-1] > bbox.w:
                         tile_out = tile_out[:, :, :bbox.h, :bbox.w]
 
+                    # VARIABLE DENOISE: Check if this tile should be active at this timestep
+                    # Only applies to quadtree mode with denoise values
+                    tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
+
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                        # Calculate progress through denoising schedule (0 = start, 1 = end)
+                        sigmas = self.sigmas
+                        ts_in = find_nearest(t_in[0], sigmas)
+                        cur_idx = (sigmas == ts_in).nonzero()
+                        if cur_idx.shape[0] > 0:
+                            current_step = cur_idx.item()
+                            total_steps = len(sigmas) - 1
+
+                            # Progress from 0 (high noise) to 1 (low noise)
+                            progress = current_step / max(total_steps, 1)
+
+                            # For denoise=0.3, tile becomes active when progress >= 0.7 (1 - 0.3)
+                            # This matches img2img semantics: low denoise = preserve more
+                            activation_threshold = 1.0 - tile_denoise
+
+                            if progress < activation_threshold:
+                                # Tile not yet active - preserve input instead of using model output
+                                # Blend: early in schedule, use more input; later, transition to output
+                                blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
+                                tile_input = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+
+                                # CRITICAL FIX: Crop tile_input to match tile_out size
+                                # tile_out is cropped to bbox dimensions, but tile_input includes padding
+                                if tile_input.shape[-2:] != tile_out.shape[-2:]:
+                                    tile_input = tile_input[:, :, :tile_out.shape[-2], :tile_out.shape[-1]]
+
+                                tile_out = tile_input * (1 - blend_factor) + tile_out * blend_factor
+
                     if use_qt:
-                        # In quadtree mode
+                        # In quadtree mode with square tiles
+                        # Calculate intersection with image boundaries
+                        x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+                        x_start = max(0, x)
+                        y_start = max(0, y)
+                        x_end = min(self.w, x + w)
+                        y_end = min(self.h, y + h)
+
+                        # Calculate offset into tile (accounts for padding we added earlier)
+                        tile_x_offset = x_start - x
+                        tile_y_offset = y_start - y
+
+                        # Extract the valid portion of the tile (without padding)
+                        valid_tile = tile_out[:, :,
+                                              tile_y_offset:tile_y_offset + (y_end - y_start),
+                                              tile_x_offset:tile_x_offset + (x_end - x_start)]
+
                         if self.tile_overlap > 0:
                             # With overlap enabled, use weighted blending
-                            # Generate Gaussian weights for this specific tile size
-                            tile_weights = self.get_weight(bbox.w, bbox.h)
+                            # Generate Gaussian weights for the FULL tile size (including padding)
+                            tile_weights_full = self.get_weight(bbox.w, bbox.h)
+                            # Extract only the weights for the valid (non-padded) portion
+                            tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                            tile_x_offset:tile_x_offset + (x_end - x_start)]
                             # Reshape to [1, 1, H, W] for proper broadcasting with 4D tensors
                             tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
                             # Add weighted tile to buffer - normalization will happen after all tiles are processed
-                            self.x_buffer[bbox.slicer] += tile_out * tile_weights
+                            self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_tile * tile_weights
                         else:
-                            # Without overlap, tiles don't overlap - use simple direct assignment
-                            self.x_buffer[bbox.slicer] = tile_out
+                            # Without overlap, use simple direct assignment
+                            self.x_buffer[:, :, y_start:y_end, x_start:x_end] = valid_tile
                     else:
                         # In grid mode, tiles overlap - use weighted blending
                         # These weights can be calcluated in advance, but will cost a lot of vram
@@ -1061,8 +1343,22 @@ class MixtureOfDiffusers(AbstractDiffusion):
         if use_qt and self.tile_overlap > 0:
             print(f'[Quadtree Diffusion DEBUG]: x_out shape={x_out.shape}, weights shape={self.weights.shape}')
             print(f'[Quadtree Diffusion DEBUG]: weights min={self.weights.min():.4f}, max={self.weights.max():.4f}, mean={self.weights.mean():.4f}')
-            x_out = x_out / self.weights
+
+            # CRITICAL: Handle division by zero for uncovered pixels
+            # Only normalize pixels that were actually covered by tiles (weight > epsilon)
+            epsilon = 1e-6
+            mask = self.weights > epsilon
+            x_out = torch.where(mask, x_out / torch.clamp(self.weights, min=epsilon), x_out)
+
             print(f'[Quadtree Diffusion DEBUG]: After normalization, x_out min={x_out.min():.4f}, max={x_out.max():.4f}')
+
+            # Check for uncovered pixels and warn user
+            uncovered_pixels = (~mask).sum().item()
+            if uncovered_pixels > 0:
+                total_pixels = mask.numel()
+                pct = 100.0 * uncovered_pixels / total_pixels
+                print(f'[Quadtree Diffusion]: ⚠️  {uncovered_pixels}/{total_pixels} pixels ({pct:.1f}%) not covered by any tile!')
+                print(f'[Quadtree Diffusion]: This can cause artifacts. Try: increase overlap, decrease content_threshold, or increase max_depth')
 
         return x_out
 
