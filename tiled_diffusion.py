@@ -1154,7 +1154,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 from .utils import store
                 if hasattr(store, 'sigmas'):
                     self.sigmas = store.sigmas
-            except:
+                    print(f'[Quadtree Variable Denoise]: Loaded sigmas from store, length={len(self.sigmas)}')
+                else:
+                    print(f'[Quadtree Variable Denoise]: WARNING - No sigmas in store, variable denoise will NOT work')
+            except Exception as e:
+                print(f'[Quadtree Variable Denoise]: WARNING - Failed to load sigmas: {e}')
                 pass
 
         self.refresh = False
@@ -1265,6 +1269,16 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     # Only applies to quadtree mode with denoise values
                     tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
 
+                    # DEBUG: Log first tile's denoise value once per batch
+                    if use_qt and i == 0 and batch_id == 0 and not hasattr(self, '_logged_denoise'):
+                        print(f'[Quadtree Variable Denoise]: First tile denoise={tile_denoise:.3f}')
+                        print(f'[Quadtree Variable Denoise]: use_qt={use_qt}, has_sigmas={hasattr(self, "sigmas")}, sigmas_not_none={self.sigmas is not None if hasattr(self, "sigmas") else False}')
+                        if hasattr(self, 'sigmas') and self.sigmas is not None:
+                            print(f'[Quadtree Variable Denoise]: Variable denoise IS ACTIVE for tiles with denoise < 1.0')
+                        else:
+                            print(f'[Quadtree Variable Denoise]: Variable denoise DISABLED - sigmas not available')
+                        self._logged_denoise = True
+
                     if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
                         # Calculate progress through denoising schedule (0 = start, 1 = end)
                         sigmas = self.sigmas
@@ -1286,6 +1300,12 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                 # Blend: early in schedule, use zero noise; later, transition to model output
                                 # This preserves the latent by indicating "no change" to the scheduler
                                 blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
+
+                                # DEBUG: Log when variable denoise is actually applied (first tile only)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise_applied'):
+                                    print(f'[Quadtree Variable Denoise]: APPLYING preservation - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, threshold={activation_threshold:.3f}, blend={blend_factor:.3f}')
+                                    self._logged_var_denoise_applied = True
+
                                 zero_noise = torch.zeros_like(tile_out)
                                 tile_out = zero_noise * (1 - blend_factor) + tile_out * blend_factor
 
