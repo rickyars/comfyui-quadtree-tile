@@ -392,10 +392,7 @@ class AbstractDiffusion:
             # This prevents coverage gaps and empty tensor extraction
             original_leaf_count = len(leaves)
 
-            # DEBUG: Print dimensions and overlap
-            print(f'[Quadtree Diffusion DEBUG]: Image dimensions: {self.w}x{self.h} latent, overlap={overlap}')
-
-            # Filter out-of-bounds leaves, accounting for overlap that will be added later (lines 397-400)
+            # Filter out-of-bounds leaves, accounting for overlap that will be added later
             # A leaf should be KEPT if its tile (after adding overlap) overlaps with the image
             # Tile position after overlap: (leaf.x // 8 - overlap, leaf.y // 8 - overlap)
             # Tile end after overlap: (leaf.x // 8 + leaf.w // 8 + overlap, leaf.y // 8 + leaf.h // 8 + overlap)
@@ -437,17 +434,6 @@ class AbstractDiffusion:
 
                 if should_filter:
                     filtered_leaves.append(leaf)
-                    # Concise debug output
-                    reasons = []
-                    if core_outside_x:
-                        reasons.append(f"core X outside")
-                    if core_outside_y:
-                        reasons.append(f"core Y outside")
-                    if tile_no_overlap_x and not core_outside_x:
-                        reasons.append(f"tile X no overlap")
-                    if tile_no_overlap_y and not core_outside_y:
-                        reasons.append(f"tile Y no overlap")
-                    print(f'[DEBUG] Filtered leaf: core_latent=({core_start_x},{core_start_y},{core_end_x-core_start_x},{core_end_y-core_start_y}) reason=[{", ".join(reasons)}]')
                 else:
                     kept_leaves.append(leaf)
 
@@ -456,9 +442,27 @@ class AbstractDiffusion:
             if len(filtered_leaves) > 0:
                 print(f'[Quadtree Diffusion]: Filtered {len(filtered_leaves)} out-of-bounds leaves (using runtime dimensions {self.w}x{self.h} latent)')
 
+                # CRITICAL FIX: Reassign denoise values after filtering
+                # The original denoise values were calculated including filtered leaves,
+                # so the largest filtered tile had min_denoise. After filtering, we need
+                # to reassign so the largest REMAINING tile gets min_denoise.
+                if len(leaves) > 0:
+                    min_denoise = visualizer_quadtree['min_denoise']
+                    max_denoise = visualizer_quadtree['max_denoise']
+
+                    # Find new max area among kept leaves only
+                    max_tile_area = max(leaf.w * leaf.h for leaf in leaves)
+
+                    # Reassign denoise values
+                    for leaf in leaves:
+                        tile_area = leaf.w * leaf.h
+                        size_ratio = tile_area / max_tile_area
+                        leaf.denoise = min_denoise + (max_denoise - min_denoise) * (1.0 - size_ratio)
+
+                    print(f'[Quadtree Diffusion]: Reassigned denoise values after filtering')
+                    print(f'[Quadtree Diffusion]: New denoise range: {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
+
             bbox_list = []
-            print(f'[Quadtree Diffusion DEBUG]: Processing {len(leaves)} kept leaves')
-            boundary_leaves = 0
             for idx, leaf in enumerate(leaves):
                 # Scale from image space to latent space (divide by 8)
                 core_x, core_y = leaf.x // 8, leaf.y // 8
@@ -471,10 +475,6 @@ class AbstractDiffusion:
                 y = core_y - overlap
                 w = core_w + 2 * overlap
                 h = core_h + 2 * overlap
-
-                # DEBUG: Count leaves near boundaries
-                if core_x + core_w >= self.w - 20 or core_y + core_h >= self.h - 20:
-                    boundary_leaves += 1
 
                 # Tiles MUST remain square (w == h) for Approach A
                 assert w == h, f"Tile not square after overlap: {w}x{h} at ({x},{y})"
@@ -516,8 +516,6 @@ class AbstractDiffusion:
                     if x_end > x_start and y_end > y_start:
                         self.weights[:, :, y_start:y_end, x_start:x_end] += self.get_tile_weights()
 
-            print(f'[Quadtree Diffusion DEBUG]: {boundary_leaves} leaves near image boundaries')
-
             bboxes = bbox_list
             leaves = visualizer_quadtree['leaves']
         else:
@@ -527,26 +525,6 @@ class AbstractDiffusion:
         # Validate full coverage
         if self.weights.min() < 1e-6:
             uncovered = (self.weights < 1e-6).sum().item()
-            # DEBUG: Find where uncovered pixels are
-            uncovered_mask = (self.weights[0, 0] < 1e-6)
-            uncovered_coords = torch.nonzero(uncovered_mask, as_tuple=False)
-            if len(uncovered_coords) > 0:
-                # Show first and last few uncovered pixels
-                print(f'[DEBUG] UNCOVERED PIXELS ({uncovered} total):')
-                print(f'        Image dims: {self.w}x{self.h} latent')
-                print(f'        First uncovered pixels (y, x):')
-                for i in range(min(10, len(uncovered_coords))):
-                    y, x = uncovered_coords[i]
-                    print(f'          ({y.item()}, {x.item()})')
-                if len(uncovered_coords) > 10:
-                    print(f'        Last uncovered pixels (y, x):')
-                    for i in range(max(0, len(uncovered_coords) - 5), len(uncovered_coords)):
-                        y, x = uncovered_coords[i]
-                        print(f'          ({y.item()}, {x.item()})')
-                # Find bounding box of uncovered region
-                y_coords = uncovered_coords[:, 0]
-                x_coords = uncovered_coords[:, 1]
-                print(f'        Uncovered region bounds: y=[{y_coords.min().item()}, {y_coords.max().item()}], x=[{x_coords.min().item()}, {x_coords.max().item()}]')
             raise RuntimeError(f"Quadtree has {uncovered} uncovered pixels! Bug in quadtree implementation.")
 
         self.quadtree_leaves = leaves  # Store for potential later use
@@ -841,14 +819,9 @@ class MultiDiffusion(AbstractDiffusion):
             self.h, self.w = H, W
             self.refresh = True
 
-            # Check if quadtree mode is enabled
-            print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
-
             if use_qt:
-                print(f'[Quadtree Diffusion DEBUG]: Calling init_quadtree_bbox()')
                 self.init_quadtree_bbox(x_in, self.tile_batch_size)
             else:
-                print(f'[Quadtree Diffusion DEBUG]: Calling init_grid_bbox() - NOT using quadtree')
                 self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
 
             # init everything done, perform sanity check & pre-computations
@@ -963,14 +936,9 @@ class SpotDiffusion(AbstractDiffusion):
             self.h, self.w = H, W
             self.refresh = True
 
-            # Check if quadtree mode is enabled
-            print(f'[Quadtree Diffusion DEBUG]: In __call__, use_quadtree={use_qt}')
-
             if use_qt:
-                print(f'[Quadtree Diffusion DEBUG]: Calling init_quadtree_bbox()')
                 self.init_quadtree_bbox(x_in, self.tile_batch_size)
             else:
-                print(f'[Quadtree Diffusion DEBUG]: Calling init_grid_bbox() - NOT using quadtree')
                 self.init_grid_bbox(self.tile_width, self.tile_height, self.tile_overlap, self.tile_batch_size)
 
             # init everything done, perform sanity check & pre-computations
@@ -1154,7 +1122,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 from .utils import store
                 if hasattr(store, 'sigmas'):
                     self.sigmas = store.sigmas
-            except:
+                    print(f'[Quadtree Variable Denoise]: Loaded sigmas from store, length={len(self.sigmas)}')
+                else:
+                    print(f'[Quadtree Variable Denoise]: WARNING - No sigmas in store, variable denoise will NOT work')
+            except Exception as e:
+                print(f'[Quadtree Variable Denoise]: WARNING - Failed to load sigmas: {e}')
                 pass
 
         self.refresh = False
@@ -1277,22 +1249,39 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             # Progress from 0 (high noise) to 1 (low noise)
                             progress = current_step / max(total_steps, 1)
 
-                            # For denoise=0.3, tile becomes active when progress >= 0.7 (1 - 0.3)
-                            # This matches img2img semantics: low denoise = preserve more
-                            activation_threshold = 1.0 - tile_denoise
+                            # SIMPLIFIED APPROACH: Smooth scaling that works for both txt2img and img2img
+                            # Instead of on/off activation, use continuous scaling based on tile denoise
+                            #
+                            # tile_denoise=0.2 (large tiles, preserve more):
+                            #   - Start at scale=0.5, smoothly ramp to 1.0
+                            #   - Less aggressive denoising = preserve more
+                            #
+                            # tile_denoise=0.8 (small tiles, change more):
+                            #   - Start at scale=0.9, quickly ramp to 1.0
+                            #   - More aggressive denoising = change more
 
-                            if progress < activation_threshold:
-                                # Tile not yet active - preserve input instead of using model output
-                                # Blend: early in schedule, use more input; later, transition to output
-                                blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
-                                tile_input = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+                            # Map tile_denoise to starting scale factor
+                            # Low denoise (0.2) -> start at 0.5 (50% strength)
+                            # High denoise (0.8) -> start at 0.9 (90% strength)
+                            start_scale = 0.4 + (tile_denoise * 0.5)  # Range: 0.4-0.9
 
-                                # CRITICAL FIX: Crop tile_input to match tile_out size
-                                # tile_out is cropped to bbox dimensions, but tile_input includes padding
-                                if tile_input.shape[-2:] != tile_out.shape[-2:]:
-                                    tile_input = tile_input[:, :, :tile_out.shape[-2], :tile_out.shape[-1]]
+                            # Ramp up to full strength over the schedule
+                            # Low denoise tiles ramp slower (gentler curve)
+                            # High denoise tiles ramp faster (steeper curve)
+                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
+                            progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
 
-                                tile_out = tile_input * (1 - blend_factor) + tile_out * blend_factor
+                            # Final scale factor: start_scale + remaining distance * curved progress
+                            scale_factor = start_scale + (1.0 - start_scale) * progress_curved
+                            scale_factor = max(0.4, min(1.0, scale_factor))  # Clamp to [0.4, 1.0]
+
+                            # Log smooth scaling info (first tile only, once per session)
+                            if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                print(f'[Quadtree Variable Denoise]: SMOOTH SCALING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, start_scale={start_scale:.3f}, scale={scale_factor:.3f}')
+                                self._logged_var_denoise = True
+
+                            # Scale the noise prediction
+                            tile_out = tile_out * scale_factor
 
                     if use_qt:
                         # In quadtree mode with square tiles
@@ -1341,16 +1330,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
         # For quadtree with overlap, normalize by accumulated weights
         if use_qt and self.tile_overlap > 0:
-            print(f'[Quadtree Diffusion DEBUG]: x_out shape={x_out.shape}, weights shape={self.weights.shape}')
-            print(f'[Quadtree Diffusion DEBUG]: weights min={self.weights.min():.4f}, max={self.weights.max():.4f}, mean={self.weights.mean():.4f}')
-
             # CRITICAL: Handle division by zero for uncovered pixels
             # Only normalize pixels that were actually covered by tiles (weight > epsilon)
             epsilon = 1e-6
             mask = self.weights > epsilon
             x_out = torch.where(mask, x_out / torch.clamp(self.weights, min=epsilon), x_out)
-
-            print(f'[Quadtree Diffusion DEBUG]: After normalization, x_out min={x_out.min():.4f}, max={x_out.max():.4f}')
 
             # Check for uncovered pixels and warn user
             uncovered_pixels = (~mask).sum().item()
