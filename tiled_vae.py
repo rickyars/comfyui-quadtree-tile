@@ -886,11 +886,6 @@ class VAEHook:
         print(f'[Quadtree VAE]: Tile sizes range from {min(tile_sizes)} to {max(tile_sizes)} pixels')
         print(f'[Quadtree VAE]: Variance range: {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
 
-        # Print detailed tile info for first few tiles to verify they're not uniform
-        print(f'[Quadtree VAE]: First 10 tile dimensions (wxh):')
-        for i, leaf in enumerate(leaves[:10]):
-            print(f'  Tile {i}: {leaf.w}x{leaf.h} at ({leaf.x},{leaf.y}) variance={leaf.variance:.4f}')
-
         # Check if tiles are actually adaptive (different sizes)
         unique_sizes = set((leaf.w, leaf.h) for leaf in leaves)
         if len(unique_sizes) == 1:
@@ -1007,7 +1002,6 @@ class VAEHook:
                 else:
                     # Fall back to replicate for tiles extending far beyond image
                     tile = F.pad(tile, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
-                print(f'[Quadtree VAE]: Padded tile at ({x1},{y1}) with padding (L:{pad_left}, R:{pad_right}, T:{pad_top}, B:{pad_bottom})')
 
             tiles.append(tile.cpu())
 
