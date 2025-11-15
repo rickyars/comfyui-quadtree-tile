@@ -456,6 +456,26 @@ class AbstractDiffusion:
             if len(filtered_leaves) > 0:
                 print(f'[Quadtree Diffusion]: Filtered {len(filtered_leaves)} out-of-bounds leaves (using runtime dimensions {self.w}x{self.h} latent)')
 
+                # CRITICAL FIX: Reassign denoise values after filtering
+                # The original denoise values were calculated including filtered leaves,
+                # so the largest filtered tile had min_denoise. After filtering, we need
+                # to reassign so the largest REMAINING tile gets min_denoise.
+                if len(leaves) > 0:
+                    min_denoise = visualizer_quadtree['min_denoise']
+                    max_denoise = visualizer_quadtree['max_denoise']
+
+                    # Find new max area among kept leaves only
+                    max_tile_area = max(leaf.w * leaf.h for leaf in leaves)
+
+                    # Reassign denoise values
+                    for leaf in leaves:
+                        tile_area = leaf.w * leaf.h
+                        size_ratio = tile_area / max_tile_area
+                        leaf.denoise = min_denoise + (max_denoise - min_denoise) * (1.0 - size_ratio)
+
+                    print(f'[Quadtree Diffusion]: Reassigned denoise values after filtering')
+                    print(f'[Quadtree Diffusion]: New denoise range: {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
+
             bbox_list = []
             print(f'[Quadtree Diffusion DEBUG]: Processing {len(leaves)} kept leaves')
             boundary_leaves = 0
