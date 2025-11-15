@@ -1296,18 +1296,23 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             activation_threshold = 1.0 - tile_denoise
 
                             if progress < activation_threshold:
-                                # Tile not yet active - return zero noise prediction to preserve input
-                                # Blend: early in schedule, use zero noise; later, transition to model output
-                                # This preserves the latent by indicating "no change" to the scheduler
-                                blend_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.1)) / 0.1))
+                                # Tile not yet active - scale down the denoising strength
+                                # This works for both txt2img and img2img:
+                                # - txt2img: Reduces denoising speed, keeping more noise longer
+                                # - img2img: Reduces changes to input, preserving more
+
+                                # Calculate how much to scale the prediction
+                                # Early in tile's schedule: scale ~ 0.0 (minimal denoising)
+                                # Near activation: scale ~ 1.0 (full denoising)
+                                scale_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.2)) / 0.2))
 
                                 # DEBUG: Log when variable denoise is actually applied (first tile only)
                                 if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise_applied'):
-                                    print(f'[Quadtree Variable Denoise]: APPLYING preservation - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, threshold={activation_threshold:.3f}, blend={blend_factor:.3f}')
+                                    print(f'[Quadtree Variable Denoise]: SCALING denoising - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, threshold={activation_threshold:.3f}, scale={scale_factor:.3f}')
                                     self._logged_var_denoise_applied = True
 
-                                zero_noise = torch.zeros_like(tile_out)
-                                tile_out = zero_noise * (1 - blend_factor) + tile_out * blend_factor
+                                # Scale the noise prediction to slow down denoising
+                                tile_out = tile_out * scale_factor
 
                     if use_qt:
                         # In quadtree mode with square tiles
