@@ -1311,24 +1311,50 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             # Progress from 0 (high noise) to 1 (low noise)
                             progress = current_step / max(total_steps, 1)
 
-                            # For denoise=0.3, tile becomes active when progress >= 0.7 (1 - 0.3)
-                            # This matches img2img semantics: low denoise = preserve more
-                            activation_threshold = 1.0 - tile_denoise
+                            # Detect if this is img2img by checking if we're using partial sigmas
+                            # In img2img, the first sigma is lower (less noise) than max possible
+                            # In txt2img, we start from maximum noise
+                            max_sigma = sigmas.max().item()
+                            first_sigma = sigmas[0].item()
+                            is_img2img = first_sigma < (max_sigma * 0.95)  # If first < 95% of max, likely img2img
+
+                            # For img2img, tile denoise should be relative to the actual denoising amount
+                            if is_img2img:
+                                # Estimate the global denoise strength from sigma range
+                                # This is approximate but works well enough
+                                sigma_range_used = first_sigma / (max_sigma + 1e-8)
+                                global_denoise_estimate = 1.0 - sigma_range_used
+
+                                # Adjust tile denoise to be relative to global denoise
+                                # If global denoise=0.7 and tile denoise=0.2, effective is 0.2/0.7 = 0.286
+                                effective_tile_denoise = min(1.0, tile_denoise / max(global_denoise_estimate, 0.1))
+                                activation_threshold = 1.0 - effective_tile_denoise
+
+                                # Log this once
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_img2img_adjust'):
+                                    print(f'[Quadtree Variable Denoise]: Detected img2img mode (first_sigma={first_sigma:.3f}, max_sigma={max_sigma:.3f})')
+                                    print(f'[Quadtree Variable Denoise]: Global denoise estimate: {global_denoise_estimate:.3f}')
+                                    print(f'[Quadtree Variable Denoise]: Adjusted tile denoise: {tile_denoise:.3f} -> effective {effective_tile_denoise:.3f}')
+                                    self._logged_img2img_adjust = True
+                            else:
+                                # txt2img: use tile denoise as-is
+                                activation_threshold = 1.0 - tile_denoise
 
                             if progress < activation_threshold:
                                 # Tile not yet active - scale down the denoising strength
-                                # This works for both txt2img and img2img:
-                                # - txt2img: Reduces denoising speed, keeping more noise longer
-                                # - img2img: Reduces changes to input, preserving more
-
                                 # Calculate how much to scale the prediction
-                                # Early in tile's schedule: scale ~ 0.0 (minimal denoising)
+                                # Early in tile's schedule: scale ~ minimum (light denoising)
                                 # Near activation: scale ~ 1.0 (full denoising)
-                                scale_factor = max(0.0, min(1.0, (progress - (activation_threshold - 0.2)) / 0.2))
+
+                                # For img2img, use higher minimum scale to avoid gray areas
+                                min_scale = 0.3 if is_img2img else 0.0
+                                transition_window = 0.2
+
+                                scale_factor = max(min_scale, min(1.0, (progress - (activation_threshold - transition_window)) / transition_window))
 
                                 # DEBUG: Log when variable denoise is actually applied (first tile only)
                                 if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise_applied'):
-                                    print(f'[Quadtree Variable Denoise]: SCALING denoising - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, threshold={activation_threshold:.3f}, scale={scale_factor:.3f}')
+                                    print(f'[Quadtree Variable Denoise]: SCALING denoising - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, threshold={activation_threshold:.3f}, scale={scale_factor:.3f}, min_scale={min_scale}')
                                     self._logged_var_denoise_applied = True
 
                                 # Scale the noise prediction to slow down denoising
