@@ -1253,17 +1253,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             # Instead of on/off activation, use continuous scaling based on tile denoise
                             #
                             # tile_denoise=0.2 (large tiles, preserve more):
-                            #   - Start at scale=0.5, smoothly ramp to 1.0
+                            #   - Start at scale=0.75, smoothly ramp to 1.0
                             #   - Less aggressive denoising = preserve more
                             #
                             # tile_denoise=0.8 (small tiles, change more):
-                            #   - Start at scale=0.9, quickly ramp to 1.0
+                            #   - Start at scale=0.90, quickly ramp to 1.0
                             #   - More aggressive denoising = change more
 
                             # Map tile_denoise to starting scale factor
-                            # Low denoise (0.2) -> start at 0.5 (50% strength)
-                            # High denoise (0.8) -> start at 0.9 (90% strength)
-                            start_scale = 0.4 + (tile_denoise * 0.5)  # Range: 0.4-0.9
+                            # FIX: Increased minimum scale from 0.4 to 0.70 to preserve color enhancement
+                            # Old formula was too aggressive, causing color washing in large tiles
+                            # Low denoise (0.2) -> start at 0.75 (75% strength) [was 0.5]
+                            # High denoise (0.8) -> start at 0.90 (90% strength) [was 0.9]
+                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
 
                             # Ramp up to full strength over the schedule
                             # Low denoise tiles ramp slower (gentler curve)
@@ -1273,7 +1275,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
                             # Final scale factor: start_scale + remaining distance * curved progress
                             scale_factor = start_scale + (1.0 - start_scale) * progress_curved
-                            scale_factor = max(0.4, min(1.0, scale_factor))  # Clamp to [0.4, 1.0]
+                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
 
                             # Log smooth scaling info (first tile only, once per session)
                             if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
