@@ -186,6 +186,9 @@ class QuadtreeBuilder:
         # Cache key: (dtype, device, num_channels) -> (sobel_x, sobel_y)
         self._sobel_cache = {}
 
+        # Active threshold (auto-scaled based on tensor type, set in build_tree)
+        self._active_threshold = content_threshold  # Default, will be overridden in build_tree
+
     def _get_sobel_kernels(self, dtype: torch.dtype, device: torch.device, num_channels: int):
         """
         Lazy-load and cache Sobel kernels for edge detection
@@ -324,6 +327,21 @@ class QuadtreeBuilder:
             self.gradient_weight * spatial_variance
         )
 
+        # Debug logging for variance calculation (only log occasionally to avoid spam)
+        # This helps diagnose threshold issues
+        import random
+        if random.random() < 0.1:  # Log ~10% of variance calculations
+            if self.variance_mode == 'combined':
+                print(f'[Quadtree Variance]: Region ({x}, {y}) size {w}x{h}: '
+                      f'color={color_variance:.4f}, gradient={spatial_variance:.4f}, '
+                      f'combined={combined_variance:.4f} (weights: c={self.color_weight:.2f}, g={self.gradient_weight:.2f})')
+            elif self.variance_mode == 'gradient':
+                print(f'[Quadtree Variance]: Region ({x}, {y}) size {w}x{h}: '
+                      f'gradient={spatial_variance:.4f}')
+            else:  # color mode
+                print(f'[Quadtree Variance]: Region ({x}, {y}) size {w}x{h}: '
+                      f'color={color_variance:.4f}')
+
         return combined_variance
 
     def should_subdivide(self, node: QuadtreeNode, variance: float) -> bool:
@@ -339,6 +357,9 @@ class QuadtreeBuilder:
         """
         # Don't subdivide if at max depth
         if node.depth >= self.max_depth:
+            if variance > self._active_threshold:
+                print(f'[Quadtree Builder]:    ⛔ Node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
+                      f'variance={variance:.4f} > threshold={self._active_threshold:.4f} but at max_depth={self.max_depth}')
             return False
 
         # Don't subdivide if tile would be too small
@@ -347,10 +368,23 @@ class QuadtreeBuilder:
         half_h_aligned = ((node.h // 2) // 8) * 8
 
         if half_w_aligned < max(self.min_tile_size, 8) or half_h_aligned < max(self.min_tile_size, 8):
+            if variance > self._active_threshold:
+                print(f'[Quadtree Builder]:    ⛔ Node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
+                      f'variance={variance:.4f} > threshold={self._active_threshold:.4f} but would create tiles below min_size={self.min_tile_size}')
             return False
 
-        # Subdivide if variance is above threshold
-        return variance > self.content_threshold
+        # Subdivide if variance is above threshold (use auto-scaled threshold)
+        should_split = variance > self._active_threshold
+
+        # Debug logging for subdivision decisions
+        if should_split:
+            print(f'[Quadtree Builder]:    ✓ Subdividing node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
+                  f'variance={variance:.4f} > threshold={self._active_threshold:.4f}')
+        else:
+            print(f'[Quadtree Builder]:    ○ Leaf node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
+                  f'variance={variance:.4f} ≤ threshold={self._active_threshold:.4f}')
+
+        return should_split
 
     def build_tree(self, tensor: torch.Tensor, root_node: QuadtreeNode = None) -> QuadtreeNode:
         """
@@ -363,6 +397,41 @@ class QuadtreeBuilder:
         Returns:
             Root node of the built quadtree
         """
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # CRITICAL FIX: Auto-detect tensor type and scale threshold
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Problem: Threshold (0.02-0.03) calibrated for image tensors [0,1]
+        #          but latent tensors have range [-3,3], causing all regions
+        #          to subdivide uniformly to max depth (regular grid)
+        #
+        # Solution: Detect tensor type by value range and auto-scale threshold
+        #           - Image tensors: [0, 1] → use threshold as-is
+        #           - Latent tensors: [-3, 3] → scale threshold by ~6-10x
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if root_node is None:
+            # Sample tensor to detect value range (only once at root)
+            tensor_min = tensor.min().item()
+            tensor_max = tensor.max().item()
+            tensor_range = tensor_max - tensor_min
+
+            # Auto-scale threshold based on tensor range
+            # MAD (Mean Absolute Deviation) scales linearly with value range
+            # Image [0, 1]: range ≈ 1.0 → threshold stays at 0.02
+            # Latent [-3, 3]: range ≈ 6.0 → threshold scales to 0.12
+            if tensor_range > 2.0:
+                # Latent space detected: scale threshold proportionally
+                scale_factor = tensor_range / 1.0  # Normalize to image range of 1.0
+                self._active_threshold = self.content_threshold * scale_factor
+                print(f'[Quadtree Builder]: 🔍 Latent space detected')
+                print(f'[Quadtree Builder]:    Value range: [{tensor_min:.2f}, {tensor_max:.2f}] (span: {tensor_range:.2f})')
+                print(f'[Quadtree Builder]:    Auto-scaled threshold: {self.content_threshold:.4f} → {self._active_threshold:.4f} ({scale_factor:.1f}x)')
+            else:
+                # Image space: use threshold as-is
+                self._active_threshold = self.content_threshold
+                print(f'[Quadtree Builder]: 🔍 Image space detected')
+                print(f'[Quadtree Builder]:    Value range: [{tensor_min:.2f}, {tensor_max:.2f}] (span: {tensor_range:.2f})')
+                print(f'[Quadtree Builder]:    Using threshold: {self._active_threshold:.4f}')
+
         # Create root node if not provided
         if root_node is None:
             if tensor.dim() == 4:
@@ -985,7 +1054,7 @@ class VAEHook:
 
         tile_input_bboxes, tile_output_bboxes = [], []
 
-        print(f'[Quadtree VAE]: Built adaptive quadtree with {len(leaves)} tiles (max_depth={self.max_depth}, threshold={self.content_threshold})')
+        print(f'[Quadtree VAE]: Built adaptive quadtree with {len(leaves)} tiles (max_depth={builder.max_depth}, threshold={builder._active_threshold:.4f})')
 
         for leaf in leaves:
             # Quadtree leaves are in the current tensor's space (h x w)
