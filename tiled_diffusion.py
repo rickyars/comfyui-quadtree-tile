@@ -1104,7 +1104,71 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 if processing_interrupted():
                     # self.pbar.close()
                     return x_in
-                # batching
+
+                # SKIP LOGIC: Separate tiles into skip and process lists
+                skip_threshold = getattr(self, 'skip_diffusion_below', 0)
+                process_bboxes = []
+                skip_bboxes = []
+
+                if use_qt and skip_threshold > 0:
+                    for bbox in bboxes:
+                        pixel_w = getattr(bbox, 'pixel_w', 0)
+                        pixel_h = getattr(bbox, 'pixel_h', 0)
+                        min_dimension = min(pixel_w, pixel_h)
+
+                        if min_dimension < skip_threshold:
+                            skip_bboxes.append(bbox)
+                        else:
+                            process_bboxes.append(bbox)
+
+                    # Log skip stats once
+                    if not hasattr(self, '_logged_skip_stats') and (skip_bboxes or process_bboxes):
+                        total = len(skip_bboxes) + len(process_bboxes)
+                        print(f'[Quadtree Skip]: Filtering {len(skip_bboxes)}/{total} tiles (min dimension < {skip_threshold}px)')
+                        self._logged_skip_stats = True
+                else:
+                    # No skipping, process all tiles
+                    process_bboxes = bboxes
+
+                # Process skip tiles: copy input directly to output buffer
+                for bbox in skip_bboxes:
+                    # Extract the input tile for this region
+                    tile_input = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+
+                    # Crop to bbox size
+                    if tile_input.shape[-2] > bbox.h or tile_input.shape[-1] > bbox.w:
+                        tile_input = tile_input[:, :, :bbox.h, :bbox.w]
+
+                    # Copy directly to output buffer (no diffusion)
+                    # Handle overlap blending if enabled
+                    x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+                    x_start = max(0, x)
+                    y_start = max(0, y)
+                    x_end = min(self.w, x + w)
+                    y_end = min(self.h, y + h)
+
+                    tile_x_offset = x_start - x
+                    tile_y_offset = y_start - y
+
+                    valid_tile = tile_input[:, :,
+                                          tile_y_offset:tile_y_offset + (y_end - y_start),
+                                          tile_x_offset:tile_x_offset + (x_end - x_start)]
+
+                    if self.tile_overlap > 0:
+                        tile_weights_full = self.get_weight(bbox.w, bbox.h)
+                        tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                        tile_x_offset:tile_x_offset + (x_end - x_start)]
+                        tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
+                        self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_tile * tile_weights
+                    else:
+                        self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_tile
+
+                # Skip model inference if no tiles to process
+                if len(process_bboxes) == 0:
+                    continue
+
+                # batching (only for tiles that need processing)
+                bboxes = process_bboxes  # Replace bboxes with filtered list
                 x_tile_list     = []
 
                 # For quadtree with overlap, extract tiles with padding if needed
@@ -1172,32 +1236,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     if tile_out.shape[-2] > bbox.h or tile_out.shape[-1] > bbox.w:
                         tile_out = tile_out[:, :, :bbox.h, :bbox.w]
 
-                    # SKIP DIFFUSION: Skip processing for tiles smaller than threshold
-                    # This preserves original details from small tiles by returning zero noise prediction
-                    skip_threshold = getattr(self, 'skip_diffusion_below', 0)
-                    tile_skipped = False
-                    if use_qt and skip_threshold > 0:
-                        # Get original pixel dimensions (stored during init_quadtree_bbox)
-                        pixel_w = getattr(bbox, 'pixel_w', 0)
-                        pixel_h = getattr(bbox, 'pixel_h', 0)
-
-                        # Check if smallest dimension is below threshold
-                        min_dimension = min(pixel_w, pixel_h)
-                        if min_dimension < skip_threshold:
-                            # Return zero noise prediction - scheduler will keep original latent
-                            tile_out = torch.zeros_like(tile_out)
-                            tile_skipped = True
-
-                            # Log once per batch (not per tile, to avoid spam)
-                            if not hasattr(self, '_logged_skip'):
-                                print(f'[Quadtree Skip]: Skipping diffusion for tiles with min dimension < {skip_threshold}px (preserves original details)')
-                                self._logged_skip = True
-
                     # VARIABLE DENOISE: Check if this tile should be active at this timestep
-                    # Only applies to quadtree mode with denoise values (and not skipped tiles)
+                    # Only applies to quadtree mode with denoise values
                     tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
 
-                    if not tile_skipped and use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
                         # Calculate progress through denoising schedule (0 = start, 1 = end)
                         sigmas = self.sigmas
                         ts_in = find_nearest(t_in[0], sigmas)
