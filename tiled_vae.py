@@ -135,11 +135,14 @@ class QuadtreeNode:
 class QuadtreeBuilder:
     """Builds a quadtree from image/latent content based on variance"""
     def __init__(self,
-                 content_threshold: float = 0.05,
+                 content_threshold: float = 0.03,
                  max_depth: int = 4,
                  min_tile_size: int = 256,
                  min_denoise: float = 0.0,
-                 max_denoise: float = 1.0):
+                 max_denoise: float = 1.0,
+                 variance_mode: str = 'combined',
+                 color_weight: float = 0.5,
+                 gradient_weight: float = 0.5):
         """
         Initialize quadtree builder
 
@@ -150,6 +153,9 @@ class QuadtreeBuilder:
             min_tile_size: Minimum tile size in pixels (won't subdivide below this)
             min_denoise: Denoise value for largest tiles
             max_denoise: Denoise value for smallest tiles
+            variance_mode: Metric type ('color', 'gradient', 'combined')
+            color_weight: Weight for color variance component (0.0-1.0)
+            gradient_weight: Weight for gradient component (0.0-1.0)
         """
         self.content_threshold = content_threshold
         self.max_depth = max_depth
@@ -158,18 +164,87 @@ class QuadtreeBuilder:
         self.max_denoise = max_denoise
         self.max_tile_area = 0  # Track maximum tile area for denoise calculation
 
+        # Variance metric configuration
+        self.variance_mode = variance_mode
+        self.color_weight = color_weight
+        self.gradient_weight = gradient_weight
+
+        # Normalize weights if in combined mode
+        if self.variance_mode == 'combined':
+            total_weight = color_weight + gradient_weight
+            if total_weight > 0:
+                self.color_weight = color_weight / total_weight
+                self.gradient_weight = gradient_weight / total_weight
+        elif self.variance_mode == 'color':
+            self.color_weight = 1.0
+            self.gradient_weight = 0.0
+        elif self.variance_mode == 'gradient':
+            self.color_weight = 0.0
+            self.gradient_weight = 1.0
+
+        # Sobel kernel cache for performance (P0 fix from manager review)
+        # Cache key: (dtype, device, num_channels) -> (sobel_x, sobel_y)
+        self._sobel_cache = {}
+
+    def _get_sobel_kernels(self, dtype: torch.dtype, device: torch.device, num_channels: int):
+        """
+        Lazy-load and cache Sobel kernels for edge detection
+
+        P0 Performance Fix: Prevents recreation of Sobel kernels on every variance calculation.
+        For a 4096x4096 image with depth=4, this saves 100+ tensor allocations.
+
+        Args:
+            dtype: Tensor dtype (e.g., torch.float32)
+            device: Tensor device (e.g., 'cuda', 'cpu', 'mps')
+            num_channels: Number of channels to create kernels for
+
+        Returns:
+            Tuple of (sobel_x, sobel_y) cached tensors
+        """
+        cache_key = (dtype, str(device), num_channels)
+
+        if cache_key not in self._sobel_cache:
+            # Sobel X operator (detects horizontal edges)
+            sobel_x = torch.tensor(
+                [[[-1, 0, 1],
+                  [-2, 0, 2],
+                  [-1, 0, 1]]],
+                dtype=dtype,
+                device=device
+            ).repeat(num_channels, 1, 1, 1)
+
+            # Sobel Y operator (detects vertical edges)
+            sobel_y = torch.tensor(
+                [[[-1, -2, -1],
+                  [ 0,  0,  0],
+                  [ 1,  2,  1]]],
+                dtype=dtype,
+                device=device
+            ).repeat(num_channels, 1, 1, 1)
+
+            self._sobel_cache[cache_key] = (sobel_x, sobel_y)
+
+        return self._sobel_cache[cache_key]
+
     def calculate_variance(self, tensor: torch.Tensor, x: int, y: int, w: int, h: int) -> float:
         """
         Calculate variance (content complexity) for a region
-        Uses mean absolute deviation from average color (matching reference implementation)
+        Combines color variance with gradient magnitude for better detail detection
 
         Args:
             tensor: Input tensor (B, C, H, W) or (C, H, W)
             x, y, w, h: Region coordinates
 
         Returns:
-            Variance value (average distance from mean color)
+            Combined variance value
         """
+        # P0 Fix: Validate tensor dimensions with descriptive errors
+        if tensor.dim() not in [3, 4]:
+            raise ValueError(
+                f"Expected 3D (C, H, W) or 4D (B, C, H, W) tensor, got {tensor.dim()}D tensor with shape {tensor.shape}. "
+                f"Ensure the input latent tensor has the correct dimensions before quadtree building."
+            )
+
         # Handle both batched and unbatched tensors
         if tensor.dim() == 4:
             region = tensor[:, :, y:y+h, x:x+w]
@@ -180,16 +255,76 @@ class QuadtreeBuilder:
         if region.numel() == 0:
             return 0.0
 
-        # Calculate average color for this region
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # COMPONENT 1: Color Variance (existing MAD calculation)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         avg_color = torch.mean(region, dim=(-2, -1), keepdim=True)
-
-        # Calculate mean absolute deviation
-        # This is "the average distance between each pixel's color and the region's average color"
-        # matching the reference implementation
         deviations = torch.abs(region - avg_color)
-        mean_absolute_deviation = torch.mean(deviations).item()
+        color_variance = torch.mean(deviations).item()
 
-        return mean_absolute_deviation
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # COMPONENT 2: Gradient Magnitude (new spatial detail detection)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # Skip gradient calculation for very small regions (performance)
+        if w < 8 or h < 8:
+            return color_variance * self.color_weight
+
+        # Early exit if only using color mode
+        if self.variance_mode == 'color':
+            return color_variance
+
+        # Ensure region is 4D for conv2d
+        if region.dim() == 3:
+            region_4d = region.unsqueeze(0)  # Add batch dimension
+        else:
+            region_4d = region
+
+        # P0 Fix: Use cached Sobel kernels instead of creating them inline
+        num_channels = region_4d.shape[1]
+        sobel_x, sobel_y = self._get_sobel_kernels(
+            dtype=region_4d.dtype,
+            device=region_4d.device,
+            num_channels=num_channels
+        )
+
+        # Compute gradients
+        try:
+            grad_x = torch.nn.functional.conv2d(
+                region_4d,
+                sobel_x,
+                padding=1,
+                groups=num_channels
+            )
+            grad_y = torch.nn.functional.conv2d(
+                region_4d,
+                sobel_y,
+                padding=1,
+                groups=num_channels
+            )
+
+            # Gradient magnitude: √(Gx² + Gy²)
+            gradient_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+
+            # P0 Fix: Normalize gradient magnitude by dividing by 8.0
+            # Sobel kernels have max magnitude of 8 (from weights -2, -1, 0, 1, 2)
+            # This brings gradient variance to comparable scale with color variance (0-1)
+            spatial_variance = torch.mean(gradient_magnitude).item() / 8.0
+
+        except Exception as e:
+            # Fallback to color variance only if gradient computation fails
+            print(f"[Quadtree]: Gradient computation failed, using color variance only: {e}")
+            spatial_variance = 0.0
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # COMBINE: Weighted sum of color and spatial variance
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        combined_variance = (
+            self.color_weight * color_variance +
+            self.gradient_weight * spatial_variance
+        )
+
+        return combined_variance
 
     def should_subdivide(self, node: QuadtreeNode, variance: float) -> bool:
         """
@@ -716,7 +851,7 @@ class GroupNormParam:
 class VAEHook:
 
     def __init__(self, net, tile_size, is_decoder:bool, fast_decoder:bool, fast_encoder:bool, color_fix:bool, to_gpu:bool=False,
-                 use_quadtree:bool=False, content_threshold:float=0.05, max_depth:int=4, min_tile_size:int=128):
+                 use_quadtree:bool=False, content_threshold:float=0.03, max_depth:int=4, min_tile_size:int=128):
         self.net = net                  # encoder | decoder
         self.tile_size = tile_size
         self.is_decoder = is_decoder
@@ -1152,7 +1287,7 @@ class TiledVAE:
 
         # Extract quadtree parameters (with defaults if not provided)
         use_quadtree = kwargs.get('use_quadtree', False)
-        content_threshold = kwargs.get('content_threshold', 0.05)
+        content_threshold = kwargs.get('content_threshold', 0.03)
         max_depth = kwargs.get('max_depth', 4)
         min_tile_size = kwargs.get('min_tile_size', 128)
 
@@ -1265,26 +1400,53 @@ class QuadtreeVisualizer:
             "required": {
                 "image": ("IMAGE",),
                 "content_threshold": ("FLOAT", {
-                    "default": 0.05,
-                    "min": 0.01,
+                    "default": 0.03,
+                    "min": 0.001,
                     "max": 0.5,
-                    "step": 0.01,
-                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas. Try 0.01-0.05 for balanced, 0.05-0.1 for conservative subdivision, 0.1+ for minimal subdivision."
+                    "step": 0.001,
+                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas."
                 }),
                 "max_depth": ("INT", {
-                    "default": 5,
+                    "default": 4,
                     "min": 1,
-                    "max": 10,
+                    "max": 8,
                     "step": 1,
-                    "tooltip": "Maximum subdivision depth. Higher = smaller minimum tiles. 5 = up to 32x32 grid, 6 = 64x64 grid"
+                    "tooltip": "Maximum quadtree depth"
                 }),
                 "min_tile_size": ("INT", {
                     "default": 256,
                     "min": 64,
-                    "max": 2048,
-                    "step": 16,
-                    "tooltip": "Minimum tile size in pixels (image space). 256-512px recommended for most cases. Smaller = more tiles but slower."
+                    "max": 1024,
+                    "step": 8,
+                    "tooltip": "Minimum tile size in pixels"
                 }),
+
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # Variance metric configuration
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                "variance_mode": (["color", "gradient", "combined"], {
+                    "default": "combined",
+                    "tooltip": "Metric for detail detection:\n" +
+                              "• color: Color variation only (fast)\n" +
+                              "• gradient: Spatial edges/texture (slower)\n" +
+                              "• combined: Both (recommended)"
+                }),
+                "color_weight": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.1,
+                    "tooltip": "Weight for color variance (only used in 'combined' mode)"
+                }),
+                "gradient_weight": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.1,
+                    "tooltip": "Weight for gradient magnitude (only used in 'combined' mode)"
+                }),
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
                     "min": 0.0,
@@ -1299,7 +1461,13 @@ class QuadtreeVisualizer:
                     "step": 0.05,
                     "tooltip": "Denoise strength for smallest tiles (high complexity areas). Should be >= min_denoise"
                 }),
-                "line_thickness": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "line_thickness": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "tooltip": "Thickness of quadtree boundary lines"
+                }),
             }
         }
 
@@ -1307,7 +1475,9 @@ class QuadtreeVisualizer:
     FUNCTION = "visualize"
     CATEGORY = "_for_testing/quadtree"
 
-    def visualize(self, image, content_threshold, max_depth, min_tile_size, min_denoise, max_denoise, line_thickness):
+    def visualize(self, image, content_threshold, max_depth, min_tile_size,
+                  variance_mode, color_weight, gradient_weight,
+                  min_denoise, max_denoise, line_thickness):
         """
         Visualize the quadtree structure overlaid on the input image
 
@@ -1316,6 +1486,9 @@ class QuadtreeVisualizer:
             content_threshold: Variance threshold for subdivision
             max_depth: Maximum tree depth
             min_tile_size: Minimum tile size
+            variance_mode: Metric type ('color', 'gradient', 'combined')
+            color_weight: Weight for color variance component
+            gradient_weight: Weight for gradient component
             min_denoise: Min denoise value for large tiles
             max_denoise: Max denoise value for small tiles
             line_thickness: Thickness of boundary lines
@@ -1343,7 +1516,10 @@ class QuadtreeVisualizer:
                 max_depth=max_depth,
                 min_tile_size=min_tile_size,
                 min_denoise=min_denoise,
-                max_denoise=max_denoise
+                max_denoise=max_denoise,
+                variance_mode=variance_mode,
+                color_weight=color_weight,
+                gradient_weight=gradient_weight
             )
             root, leaves = builder.build(img_tensor)
 
