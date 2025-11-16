@@ -239,11 +239,23 @@ class QuadtreeBuilder:
             # This ensures all children will be square (quadtree property)
             root_size = max(w, h)
 
-            # Ensure root size is aligned to 16-pixel boundaries
-            # WHY 16: VAE needs 8x (divisible by 8), but square subdivision requires 16x
-            # Square subdivision: parent N splits to children N/2 and N/2
-            # For squares: N/2 must equal N - N/2, so N must be divisible by 16
-            root_size = ((root_size + 15) // 16) * 16
+            # CRITICAL: Use power-of-2 multiple of 8 for recursive square subdivision
+            # Why: When subdividing with 8-pixel alignment, only power-of-2 multiples
+            # of 8 can recursively subdivide into equal squares at all levels.
+            #
+            # Example problem: 600→296,304 (non-square!), but 512→256,256 (square!)
+            #
+            # Find next power: 8 * 2^n where 8 * 2^n >= root_size
+            # Valid sizes: 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384...
+            import math
+            if root_size <= 8:
+                root_size = 8
+            else:
+                # Find smallest n where 8 * 2^n >= root_size
+                # Rearrange: 2^n >= root_size / 8
+                # Therefore: n >= log2(root_size / 8)
+                n = math.ceil(math.log2(root_size / 8))
+                root_size = 8 * (2 ** n)
 
             # Create square root node at origin (0, 0)
             # This square will cover the entire image and extend beyond if needed
