@@ -1238,9 +1238,9 @@ class QuadtreeVisualizer:
                 "min_tile_size": ("INT", {
                     "default": 4,
                     "min": 1,
-                    "max": 50,
+                    "max": 256,
                     "step": 1,
-                    "tooltip": "Minimum tile size in pixels (1-50). Matches JavaScript minSize. Note: must be 8-aligned for VAE."
+                    "tooltip": "Minimum tile size in pixels (1-256). Matches JavaScript minSize. Note: must be 8-aligned for VAE."
                 }),
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
