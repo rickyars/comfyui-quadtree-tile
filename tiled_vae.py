@@ -234,16 +234,17 @@ class QuadtreeBuilder:
             else:
                 _, h, w = tensor.shape
 
-            # Create square root covering entire image (power-of-2 multiple of 8)
-            root_size = max(w, h)
+            # Create RECTANGULAR root matching actual image dimensions
+            # Align to 8-pixel boundaries for VAE compatibility
+            # (exactly like JavaScript: just use width/height directly)
+            w_aligned = (w // 8) * 8
+            h_aligned = (h // 8) * 8
 
-            if root_size <= 8:
-                root_size = 8
-            else:
-                n = math.ceil(math.log2(root_size / 8))
-                root_size = 8 * (2 ** n)
+            # Ensure minimum 8 pixels
+            w_aligned = max(w_aligned, 8)
+            h_aligned = max(h_aligned, 8)
 
-            root_node = QuadtreeNode(0, 0, root_size, root_size, 0)
+            root_node = QuadtreeNode(0, 0, w_aligned, h_aligned, 0)
 
         # Calculate variance for this node
         variance = self.calculate_variance(tensor, root_node.x, root_node.y, root_node.w, root_node.h)
@@ -1224,10 +1225,10 @@ class QuadtreeVisualizer:
                 }),
                 "min_tile_size": ("INT", {
                     "default": 256,
-                    "min": 128,
+                    "min": 64,
                     "max": 1024,
                     "step": 8,
-                    "tooltip": "Minimum tile size in pixels. Must be at least 128 to ensure edge tiles remain large enough for effective diffusion after cropping."
+                    "tooltip": "Minimum tile size in pixels. With rectangular quadtree, tiles naturally stay within image bounds."
                 }),
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
@@ -1298,88 +1299,8 @@ class QuadtreeVisualizer:
             )
             root, leaves = builder.build(img_tensor)
 
-            # CROP EDGE TILES TO IMAGE BOUNDS
-            # The quadtree creates a square root that extends beyond rectangular images
-            # Instead of filtering, crop edge tiles to create rectangular tiles at boundaries
-            original_leaf_count = len(leaves)
-            cropped_leaves = []
-            filtered_count = 0
-            cropped_count = 0
-
-            for leaf in leaves:
-                # Check if tile overlaps with image at all
-                if leaf.x >= w or (leaf.x + leaf.w) <= 0 or leaf.y >= h or (leaf.y + leaf.h) <= 0:
-                    # Completely outside - skip it
-                    filtered_count += 1
-                    continue
-
-                # Tile overlaps - crop to image bounds
-                new_x = max(0, leaf.x)
-                new_y = max(0, leaf.y)
-                new_w = min(w, leaf.x + leaf.w) - new_x
-                new_h = min(h, leaf.y + leaf.h) - new_y
-
-                # For edge tiles that would be too small, extend them inward instead of dropping
-                # This maintains coverage while avoiding degenerate tiny tiles
-                MIN_EDGE_TILE_DIM = 128
-                extended = False
-
-                if new_w < MIN_EDGE_TILE_DIM:
-                    # Try to extend inward (reduce new_x) to reach minimum
-                    shortage = MIN_EDGE_TILE_DIM - new_w
-                    can_extend = min(shortage, new_x)  # Can't extend past x=0
-                    if can_extend > 0:
-                        new_x -= can_extend
-                        new_w += can_extend
-                        extended = True
-
-                if new_h < MIN_EDGE_TILE_DIM:
-                    # Try to extend inward (reduce new_y) to reach minimum
-                    shortage = MIN_EDGE_TILE_DIM - new_h
-                    can_extend = min(shortage, new_y)  # Can't extend past y=0
-                    if can_extend > 0:
-                        new_y -= can_extend
-                        new_h += can_extend
-                        extended = True
-
-                # Ensure dimensions are multiples of 8 for latent space alignment
-                # Round to nearest multiple of 8 (not up, to avoid extending beyond bounds)
-                new_w = (new_w // 8) * 8
-                new_h = (new_h // 8) * 8
-
-                # CRITICAL: Cap maximum tile dimensions to prevent memory issues
-                # Large tiles cause memory thrashing when moving between VRAM and RAM
-                MAX_TILE_DIM = 1024  # 128 latent pixels
-                if new_w > MAX_TILE_DIM:
-                    excess = new_w - MAX_TILE_DIM
-                    new_x += excess // 2  # Center the crop
-                    new_w = MAX_TILE_DIM
-                if new_h > MAX_TILE_DIM:
-                    excess = new_h - MAX_TILE_DIM
-                    new_y += excess // 2  # Center the crop
-                    new_h = MAX_TILE_DIM
-
-                # After rounding, if still too small, skip only if truly degenerate (< 64px)
-                if new_w < 64 or new_h < 64:
-                    filtered_count += 1
-                    continue
-
-                # Check if this was actually cropped or extended
-                if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
-                    cropped_count += 1
-                    # Create new cropped/extended leaf
-                    cropped_leaf = QuadtreeNode(new_x, new_y, new_w, new_h, leaf.depth)
-                    cropped_leaf.variance = leaf.variance
-                    cropped_leaf.denoise = leaf.denoise
-                    cropped_leaves.append(cropped_leaf)
-                else:
-                    # Keep original
-                    cropped_leaves.append(leaf)
-
-            leaves = cropped_leaves
-
-            if filtered_count > 0 or cropped_count > 0:
-                print(f'[Quadtree Visualizer]: Filtered {filtered_count} fully out-of-bounds leaves, cropped {cropped_count} edge tiles to fit {w}x{h} image')
+            # With rectangular quadtree, all tiles are naturally within image bounds
+            # No cropping or filtering needed!
 
             # Convert image to numpy for drawing
             img_np = (img.cpu().numpy() * 255).astype(np.uint8)
