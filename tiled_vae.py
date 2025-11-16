@@ -133,258 +133,92 @@ class QuadtreeNode:
 
 
 class QuadtreeBuilder:
-    """Builds a quadtree from image/latent content based on variance"""
+    """Builds a quadtree from image/latent content based on RGB Euclidean distance variance"""
     def __init__(self,
                  content_threshold: float = 0.03,
                  max_depth: int = 4,
                  min_tile_size: int = 256,
                  min_denoise: float = 0.0,
-                 max_denoise: float = 1.0,
-                 variance_mode: str = 'combined',
-                 color_weight: float = 0.5,
-                 gradient_weight: float = 0.5):
+                 max_denoise: float = 1.0):
         """
         Initialize quadtree builder
 
         Args:
             content_threshold: Variance threshold to trigger subdivision
-                              (0.005-0.25, equivalent to Processing's 5-50 on 0-255 scale)
             max_depth: Maximum recursion depth
-            min_tile_size: Minimum tile size in pixels (won't subdivide below this)
+            min_tile_size: Minimum tile size in pixels
             min_denoise: Denoise value for largest tiles
             max_denoise: Denoise value for smallest tiles
-            variance_mode: Metric type ('color', 'gradient', 'combined')
-            color_weight: Weight for color variance component (0.0-1.0)
-            gradient_weight: Weight for gradient component (0.0-1.0)
         """
         self.content_threshold = content_threshold
         self.max_depth = max_depth
         self.min_tile_size = min_tile_size
         self.min_denoise = min_denoise
         self.max_denoise = max_denoise
-        self.max_tile_area = 0  # Track maximum tile area for denoise calculation
-
-        # Variance metric configuration
-        self.variance_mode = variance_mode
-        self.color_weight = color_weight
-        self.gradient_weight = gradient_weight
-
-        # Normalize weights if in combined mode
-        if self.variance_mode == 'combined':
-            total_weight = color_weight + gradient_weight
-            if total_weight > 0:
-                self.color_weight = color_weight / total_weight
-                self.gradient_weight = gradient_weight / total_weight
-        elif self.variance_mode == 'color':
-            self.color_weight = 1.0
-            self.gradient_weight = 0.0
-        elif self.variance_mode == 'gradient':
-            self.color_weight = 0.0
-            self.gradient_weight = 1.0
-
-        # Sobel kernel cache for performance (P0 fix from manager review)
-        # Cache key: (dtype, device, num_channels) -> (sobel_x, sobel_y)
-        self._sobel_cache = {}
-
-        # Active threshold (auto-scaled based on tensor type, set in build_tree)
-        self._active_threshold = content_threshold  # Default, will be overridden in build_tree
-
-    def _get_sobel_kernels(self, dtype: torch.dtype, device: torch.device, num_channels: int):
-        """
-        Lazy-load and cache Sobel kernels for edge detection
-
-        P0 Performance Fix: Prevents recreation of Sobel kernels on every variance calculation.
-        For a 4096x4096 image with depth=4, this saves 100+ tensor allocations.
-
-        Args:
-            dtype: Tensor dtype (e.g., torch.float32)
-            device: Tensor device (e.g., 'cuda', 'cpu', 'mps')
-            num_channels: Number of channels to create kernels for
-
-        Returns:
-            Tuple of (sobel_x, sobel_y) cached tensors
-        """
-        cache_key = (dtype, str(device), num_channels)
-
-        if cache_key not in self._sobel_cache:
-            # Sobel X operator (detects horizontal edges)
-            sobel_x = torch.tensor(
-                [[[-1, 0, 1],
-                  [-2, 0, 2],
-                  [-1, 0, 1]]],
-                dtype=dtype,
-                device=device
-            ).repeat(num_channels, 1, 1, 1)
-
-            # Sobel Y operator (detects vertical edges)
-            sobel_y = torch.tensor(
-                [[[-1, -2, -1],
-                  [ 0,  0,  0],
-                  [ 1,  2,  1]]],
-                dtype=dtype,
-                device=device
-            ).repeat(num_channels, 1, 1, 1)
-
-            self._sobel_cache[cache_key] = (sobel_x, sobel_y)
-
-        return self._sobel_cache[cache_key]
+        self.max_tile_area = 0
 
     def calculate_variance(self, tensor: torch.Tensor, x: int, y: int, w: int, h: int) -> float:
         """
-        Calculate variance (content complexity) for a region
-        Combines color variance with gradient magnitude for better detail detection
+        Calculate variance as average Euclidean distance from mean color
+        Reference: avg(sqrt((R-R_avg)² + (G-G_avg)² + (B-B_avg)²))
 
         Args:
             tensor: Input tensor (B, C, H, W) or (C, H, W)
             x, y, w, h: Region coordinates
 
         Returns:
-            Combined variance value
+            Average Euclidean distance in RGB space
         """
-        # P0 Fix: Validate tensor dimensions with descriptive errors
-        if tensor.dim() not in [3, 4]:
-            raise ValueError(
-                f"Expected 3D (C, H, W) or 4D (B, C, H, W) tensor, got {tensor.dim()}D tensor with shape {tensor.shape}. "
-                f"Ensure the input latent tensor has the correct dimensions before quadtree building."
-            )
-
-        # Handle both batched and unbatched tensors
+        # Extract region
         if tensor.dim() == 4:
             region = tensor[:, :, y:y+h, x:x+w]
+            channel_dim = 1
         else:
             region = tensor[:, y:y+h, x:x+w]
+            channel_dim = 0
 
-        # Ensure region has valid size
         if region.numel() == 0:
             return 0.0
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # COMPONENT 1: Color Variance (existing MAD calculation)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        avg_color = torch.mean(region, dim=(-2, -1), keepdim=True)
-        deviations = torch.abs(region - avg_color)
-        color_variance = torch.mean(deviations).item()
+        # Compute mean color across spatial dimensions
+        mean_color = torch.mean(region, dim=(-2, -1), keepdim=True)
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # COMPONENT 2: Gradient Magnitude (new spatial detail detection)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Euclidean distance in RGB space for each pixel
+        diff = region - mean_color
+        squared_dist = torch.sum(diff ** 2, dim=channel_dim)
+        euclidean_dist = torch.sqrt(squared_dist)
 
-        # Skip gradient calculation for very small regions (performance)
-        if w < 8 or h < 8:
-            return color_variance * self.color_weight
+        # Average over all pixels (and batch if present)
+        variance = torch.mean(euclidean_dist).item()
 
-        # Early exit if only using color mode
-        if self.variance_mode == 'color':
-            return color_variance
-
-        # Ensure region is 4D for conv2d
-        if region.dim() == 3:
-            region_4d = region.unsqueeze(0)  # Add batch dimension
-        else:
-            region_4d = region
-
-        # P0 Fix: Use cached Sobel kernels instead of creating them inline
-        num_channels = region_4d.shape[1]
-        sobel_x, sobel_y = self._get_sobel_kernels(
-            dtype=region_4d.dtype,
-            device=region_4d.device,
-            num_channels=num_channels
-        )
-
-        # Compute gradients
-        try:
-            grad_x = torch.nn.functional.conv2d(
-                region_4d,
-                sobel_x,
-                padding=1,
-                groups=num_channels
-            )
-            grad_y = torch.nn.functional.conv2d(
-                region_4d,
-                sobel_y,
-                padding=1,
-                groups=num_channels
-            )
-
-            # Gradient magnitude: √(Gx² + Gy²)
-            gradient_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
-
-            # P0 Fix: Normalize gradient magnitude by dividing by 8.0
-            # Sobel kernels have max magnitude of 8 (from weights -2, -1, 0, 1, 2)
-            # This brings gradient variance to comparable scale with color variance (0-1)
-            spatial_variance = torch.mean(gradient_magnitude).item() / 8.0
-
-        except Exception as e:
-            # Fallback to color variance only if gradient computation fails
-            print(f"[Quadtree]: Gradient computation failed, using color variance only: {e}")
-            spatial_variance = 0.0
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # COMBINE: Weighted sum of color and spatial variance
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        combined_variance = (
-            self.color_weight * color_variance +
-            self.gradient_weight * spatial_variance
-        )
-
-        # Debug logging for variance calculation (only log occasionally to avoid spam)
-        # This helps diagnose threshold issues
-        import random
-        if random.random() < 0.1:  # Log ~10% of variance calculations
-            if self.variance_mode == 'combined':
-                print(f'[Quadtree Variance]: Region ({x}, {y}) size {w}x{h}: '
-                      f'color={color_variance:.4f}, gradient={spatial_variance:.4f}, '
-                      f'combined={combined_variance:.4f} (weights: c={self.color_weight:.2f}, g={self.gradient_weight:.2f})')
-            elif self.variance_mode == 'gradient':
-                print(f'[Quadtree Variance]: Region ({x}, {y}) size {w}x{h}: '
-                      f'gradient={spatial_variance:.4f}')
-            else:  # color mode
-                print(f'[Quadtree Variance]: Region ({x}, {y}) size {w}x{h}: '
-                      f'color={color_variance:.4f}')
-
-        return combined_variance
+        return variance
 
     def should_subdivide(self, node: QuadtreeNode, variance: float) -> bool:
-        """
-        Determine if a node should be subdivided
-
-        Args:
-            node: Current node
-            variance: Calculated variance for this node
-
-        Returns:
-            True if should subdivide, False otherwise
-        """
+        """Determine if a node should be subdivided"""
         # Don't subdivide if at max depth
         if node.depth >= self.max_depth:
-            if variance > self._active_threshold:
-                print(f'[Quadtree Builder]:    ⛔ Node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
-                      f'variance={variance:.4f} > threshold={self._active_threshold:.4f} but at max_depth={self.max_depth}')
             return False
 
         # Don't subdivide if tile would be too small
-        # Also ensure child tiles would be at least 8 pixels (VAE requirement)
         half_w_aligned = ((node.w // 2) // 8) * 8
         half_h_aligned = ((node.h // 2) // 8) * 8
 
         if half_w_aligned < max(self.min_tile_size, 8) or half_h_aligned < max(self.min_tile_size, 8):
-            if variance > self._active_threshold:
-                print(f'[Quadtree Builder]:    ⛔ Node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
-                      f'variance={variance:.4f} > threshold={self._active_threshold:.4f} but would create tiles below min_size={self.min_tile_size}')
             return False
 
-        # Subdivide if variance is above threshold (use auto-scaled threshold)
-        should_split = variance > self._active_threshold
+        # NEW: Check 8-pixel alignment for BOTH halves and remainders
+        # This prevents creating children that violate VAE's 8-pixel alignment requirement
+        remainder_w = node.w - half_w_aligned
+        remainder_h = node.h - half_h_aligned
 
-        # Debug logging for subdivision decisions
-        if should_split:
-            print(f'[Quadtree Builder]:    ✓ Subdividing node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
-                  f'variance={variance:.4f} > threshold={self._active_threshold:.4f}')
-        else:
-            print(f'[Quadtree Builder]:    ○ Leaf node at ({node.x}, {node.y}) size {node.w}x{node.h}: '
-                  f'variance={variance:.4f} ≤ threshold={self._active_threshold:.4f}')
+        # All children must be >=8 and multiples of 8
+        if (half_w_aligned < 8 or half_h_aligned < 8 or
+            remainder_w < 8 or remainder_h < 8 or
+            remainder_w % 8 != 0 or remainder_h % 8 != 0):
+            return False
 
-        return should_split
+        # Subdivide if variance is above threshold
+        return variance > self.content_threshold
 
     def build_tree(self, tensor: torch.Tensor, root_node: QuadtreeNode = None) -> QuadtreeNode:
         """
@@ -397,41 +231,6 @@ class QuadtreeBuilder:
         Returns:
             Root node of the built quadtree
         """
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # CRITICAL FIX: Auto-detect tensor type and scale threshold
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Problem: Threshold (0.02-0.03) calibrated for image tensors [0,1]
-        #          but latent tensors have range [-3,3], causing all regions
-        #          to subdivide uniformly to max depth (regular grid)
-        #
-        # Solution: Detect tensor type by value range and auto-scale threshold
-        #           - Image tensors: [0, 1] → use threshold as-is
-        #           - Latent tensors: [-3, 3] → scale threshold by ~6-10x
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if root_node is None:
-            # Sample tensor to detect value range (only once at root)
-            tensor_min = tensor.min().item()
-            tensor_max = tensor.max().item()
-            tensor_range = tensor_max - tensor_min
-
-            # Auto-scale threshold based on tensor range
-            # MAD (Mean Absolute Deviation) scales linearly with value range
-            # Image [0, 1]: range ≈ 1.0 → threshold stays at 0.02
-            # Latent [-3, 3]: range ≈ 6.0 → threshold scales to 0.12
-            if tensor_range > 2.0:
-                # Latent space detected: scale threshold proportionally
-                scale_factor = tensor_range / 1.0  # Normalize to image range of 1.0
-                self._active_threshold = self.content_threshold * scale_factor
-                print(f'[Quadtree Builder]: 🔍 Latent space detected')
-                print(f'[Quadtree Builder]:    Value range: [{tensor_min:.2f}, {tensor_max:.2f}] (span: {tensor_range:.2f})')
-                print(f'[Quadtree Builder]:    Auto-scaled threshold: {self.content_threshold:.4f} → {self._active_threshold:.4f} ({scale_factor:.1f}x)')
-            else:
-                # Image space: use threshold as-is
-                self._active_threshold = self.content_threshold
-                print(f'[Quadtree Builder]: 🔍 Image space detected')
-                print(f'[Quadtree Builder]:    Value range: [{tensor_min:.2f}, {tensor_max:.2f}] (span: {tensor_range:.2f})')
-                print(f'[Quadtree Builder]:    Using threshold: {self._active_threshold:.4f}')
-
         # Create root node if not provided
         if root_node is None:
             if tensor.dim() == 4:
@@ -439,30 +238,15 @@ class QuadtreeBuilder:
             else:
                 _, h, w = tensor.shape
 
-            # APPROACH A: Create SQUARE root covering entire image
-            # This ensures all children will be square (quadtree property)
+            # Create square root covering entire image (power-of-2 multiple of 8)
             root_size = max(w, h)
 
-            # CRITICAL: Use power-of-2 multiple of 8 for recursive square subdivision
-            # Why: When subdividing with 8-pixel alignment, only power-of-2 multiples
-            # of 8 can recursively subdivide into equal squares at all levels.
-            #
-            # Example problem: 600→296,304 (non-square!), but 512→256,256 (square!)
-            #
-            # Find next power: 8 * 2^n where 8 * 2^n >= root_size
-            # Valid sizes: 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384...
-            import math
             if root_size <= 8:
                 root_size = 8
             else:
-                # Find smallest n where 8 * 2^n >= root_size
-                # Rearrange: 2^n >= root_size / 8
-                # Therefore: n >= log2(root_size / 8)
                 n = math.ceil(math.log2(root_size / 8))
                 root_size = 8 * (2 ** n)
 
-            # Create square root node at origin (0, 0)
-            # This square will cover the entire image and extend beyond if needed
             root_node = QuadtreeNode(0, 0, root_size, root_size, 0)
 
         # Calculate variance for this node
@@ -481,16 +265,7 @@ class QuadtreeBuilder:
         return root_node
 
     def get_leaf_nodes(self, node: QuadtreeNode, leaves: list = None) -> list:
-        """
-        Get all leaf nodes (tiles) from the tree
-
-        Args:
-            node: Root node to start from
-            leaves: Accumulator list (created automatically)
-
-        Returns:
-            List of all leaf nodes
-        """
+        """Get all leaf nodes from the tree"""
         if leaves is None:
             leaves = []
 
@@ -504,28 +279,21 @@ class QuadtreeBuilder:
 
     def assign_denoise_values(self, root_node: QuadtreeNode):
         """
-        Assign denoise values to all leaf nodes based on tile size
+        Assign denoise values based on tile size
         Larger tiles → lower denoise (preserve)
         Smaller tiles → higher denoise (regenerate)
-
-        Args:
-            root_node: Root of the quadtree
         """
-        # First pass: find maximum tile area
         leaves = self.get_leaf_nodes(root_node)
         self.max_tile_area = max(leaf.w * leaf.h for leaf in leaves)
 
-        # Second pass: assign denoise values
         for leaf in leaves:
             tile_area = leaf.w * leaf.h
-            size_ratio = tile_area / self.max_tile_area  # 0.0 (smallest) to 1.0 (largest)
-
-            # Inverse relationship: large tiles get low denoise, small tiles get high denoise
+            size_ratio = tile_area / self.max_tile_area
             leaf.denoise = self.min_denoise + (self.max_denoise - self.min_denoise) * (1.0 - size_ratio)
 
     def build(self, tensor: torch.Tensor) -> tuple:
         """
-        Build complete quadtree and return leaf nodes with denoise values
+        Build complete quadtree and return leaf nodes
 
         Args:
             tensor: Input tensor to analyze
@@ -533,18 +301,11 @@ class QuadtreeBuilder:
         Returns:
             (root_node, leaf_nodes) tuple
         """
-        # Build the tree
         root = self.build_tree(tensor)
-
-        # Assign denoise values
         self.assign_denoise_values(root)
-
-        # Get leaf nodes
         leaves = self.get_leaf_nodes(root)
 
-        # IMPORTANT: Most leaves are square from quadtree subdivision
-        # Edge tiles may become rectangular after cropping to image bounds (handled later)
-        print(f'[Quadtree Builder]: Built quadtree with {len(leaves)} leaf nodes')
+        print(f'[Quadtree]: Built quadtree with {len(leaves)} tiles')
 
         return root, leaves
 
@@ -1054,8 +815,6 @@ class VAEHook:
 
         tile_input_bboxes, tile_output_bboxes = [], []
 
-        print(f'[Quadtree VAE]: Built adaptive quadtree with {len(leaves)} tiles (max_depth={builder.max_depth}, threshold={builder._active_threshold:.4f})')
-
         for leaf in leaves:
             # Quadtree leaves are in the current tensor's space (h x w)
             # For decoder: latent space. For encoder: image space.
@@ -1085,21 +844,6 @@ class VAEHook:
                 min(h, core_bbox[3] + pad),
             ]
             tile_input_bboxes.append(input_bbox_padded)
-
-        # Print statistics
-        min_w = min(leaf.w for leaf in leaves)
-        min_h = min(leaf.h for leaf in leaves)
-        max_w = max(leaf.w for leaf in leaves)
-        max_h = max(leaf.h for leaf in leaves)
-        print(f'[Quadtree VAE]: Tile dimensions range from {min_w}x{min_h} to {max_w}x{max_h} (image space)')
-        print(f'[Quadtree VAE]: Variance range: {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
-
-        # Check if tiles are actually adaptive (different sizes)
-        unique_sizes = set((leaf.w, leaf.h) for leaf in leaves)
-        if len(unique_sizes) == 1:
-            print(f'[Quadtree VAE]: WARNING - All tiles are the same size! Quadtree may not be working.')
-        else:
-            print(f'[Quadtree VAE]: ✓ Found {len(unique_sizes)} different tile sizes - quadtree IS adaptive')
 
         return tile_input_bboxes, tile_output_bboxes
 
@@ -1489,33 +1233,6 @@ class QuadtreeVisualizer:
                     "step": 8,
                     "tooltip": "Minimum tile size in pixels"
                 }),
-
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # Variance metric configuration
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                "variance_mode": (["color", "gradient", "combined"], {
-                    "default": "combined",
-                    "tooltip": "Metric for detail detection:\n" +
-                              "• color: Color variation only (fast)\n" +
-                              "• gradient: Spatial edges/texture (slower)\n" +
-                              "• combined: Both (recommended)"
-                }),
-                "color_weight": ("FLOAT", {
-                    "default": 0.5,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.1,
-                    "tooltip": "Weight for color variance (only used in 'combined' mode)"
-                }),
-                "gradient_weight": ("FLOAT", {
-                    "default": 0.5,
-                    "min": 0.0,
-                    "max": 1.0,
-                    "step": 0.1,
-                    "tooltip": "Weight for gradient magnitude (only used in 'combined' mode)"
-                }),
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
                     "min": 0.0,
@@ -1545,7 +1262,6 @@ class QuadtreeVisualizer:
     CATEGORY = "_for_testing/quadtree"
 
     def visualize(self, image, content_threshold, max_depth, min_tile_size,
-                  variance_mode, color_weight, gradient_weight,
                   min_denoise, max_denoise, line_thickness):
         """
         Visualize the quadtree structure overlaid on the input image
@@ -1555,9 +1271,6 @@ class QuadtreeVisualizer:
             content_threshold: Variance threshold for subdivision
             max_depth: Maximum tree depth
             min_tile_size: Minimum tile size
-            variance_mode: Metric type ('color', 'gradient', 'combined')
-            color_weight: Weight for color variance component
-            gradient_weight: Weight for gradient component
             min_denoise: Min denoise value for large tiles
             max_denoise: Max denoise value for small tiles
             line_thickness: Thickness of boundary lines
@@ -1585,10 +1298,7 @@ class QuadtreeVisualizer:
                 max_depth=max_depth,
                 min_tile_size=min_tile_size,
                 min_denoise=min_denoise,
-                max_denoise=max_denoise,
-                variance_mode=variance_mode,
-                color_weight=color_weight,
-                gradient_weight=gradient_weight
+                max_denoise=max_denoise
             )
             root, leaves = builder.build(img_tensor)
 
