@@ -786,13 +786,21 @@ def gaussian_weights(tile_w:int, tile_h:int) -> Tensor:
     This generates gaussian weights to smooth the noise of each tile.
     This is critical for this method to work.
 
-    CRITICAL FIX: Increased var from 0.01 to 0.02 to ensure edge weights > 1e-6
+    CRITICAL FIX 1: Increased var from 0.01 to 0.02 to ensure edge weights > 1e-6
     for tiles with overlap. With var=0.01, tiles ≥68×68 had edge weights < 1e-6,
     causing pixels to be marked as "uncovered" even though tiles were processing them.
+
+    CRITICAL FIX 2: Use correct tile dimension (tile_w for x, tile_h for y) in Gaussian formula.
+    Previously used tile_w for both axes, which was incorrect for non-square tiles.
+    While quadtree always creates square tiles, this fix ensures correctness.
     '''
-    f = lambda x, midpoint, var=0.02: exp(-(x-midpoint)*(x-midpoint) / (tile_w*tile_w) / (2*var)) / sqrt(2*pi*var)
-    x_probs = [f(x, (tile_w - 1) / 2) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
-    y_probs = [f(y,  (tile_h - 1) / 2) for y in range(tile_h)]  # FIXED: was tile_h / 2, now consistent with x_probs
+    # Define separate Gaussian functions for x and y axes with correct scaling
+    var = 0.02
+    f_x = lambda x, midpoint: exp(-(x-midpoint)*(x-midpoint) / (tile_w*tile_w) / (2*var)) / sqrt(2*pi*var)
+    f_y = lambda y, midpoint: exp(-(y-midpoint)*(y-midpoint) / (tile_h*tile_h) / (2*var)) / sqrt(2*pi*var)
+
+    x_probs = [f_x(x, (tile_w - 1) / 2) for x in range(tile_w)]   # -1 because index goes from 0 to latent_width - 1
+    y_probs = [f_y(y, (tile_h - 1) / 2) for y in range(tile_h)]   # FIXED: was tile_h / 2, now consistent with x_probs
 
     w = np.outer(y_probs, x_probs)
     return torch.from_numpy(w).to(devices.device, dtype=torch.float32)
