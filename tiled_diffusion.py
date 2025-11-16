@@ -289,6 +289,7 @@ class AbstractDiffusion:
         tile_batch_size = self.tile_batch_size
         compression = self.compression
         tile_overlap = getattr(self, 'tile_overlap', 8)
+        skip_diffusion_below = getattr(self, 'skip_diffusion_below', 0)
 
         # Preserve quadtree structure
         use_quadtree = getattr(self, 'use_quadtree', False)
@@ -298,6 +299,7 @@ class AbstractDiffusion:
         self.compression = compression
         self.tile_batch_size = tile_batch_size
         self.tile_overlap = tile_overlap
+        self.skip_diffusion_below = skip_diffusion_below
 
         # Restore quadtree structure
         self.use_quadtree = use_quadtree
@@ -410,6 +412,8 @@ class AbstractDiffusion:
                 bbox.denoise = leaf.denoise
                 bbox.variance = leaf.variance
                 bbox.core_region = (core_x, core_y, core_w, core_h)  # Store the non-overlapping core
+                bbox.pixel_w = leaf.w  # Store original pixel dimensions for skip logic
+                bbox.pixel_h = leaf.h
                 bbox_list.append(bbox)
 
                 # For overlap mode, accumulate actual Gaussian weights
@@ -1168,11 +1172,32 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     if tile_out.shape[-2] > bbox.h or tile_out.shape[-1] > bbox.w:
                         tile_out = tile_out[:, :, :bbox.h, :bbox.w]
 
+                    # SKIP DIFFUSION: Skip processing for tiles smaller than threshold
+                    # This preserves original details from small tiles by returning zero noise prediction
+                    skip_threshold = getattr(self, 'skip_diffusion_below', 0)
+                    tile_skipped = False
+                    if use_qt and skip_threshold > 0:
+                        # Get original pixel dimensions (stored during init_quadtree_bbox)
+                        pixel_w = getattr(bbox, 'pixel_w', 0)
+                        pixel_h = getattr(bbox, 'pixel_h', 0)
+
+                        # Check if smallest dimension is below threshold
+                        min_dimension = min(pixel_w, pixel_h)
+                        if min_dimension < skip_threshold:
+                            # Return zero noise prediction - scheduler will keep original latent
+                            tile_out = torch.zeros_like(tile_out)
+                            tile_skipped = True
+
+                            # Log once per batch (not per tile, to avoid spam)
+                            if not hasattr(self, '_logged_skip'):
+                                print(f'[Quadtree Skip]: Skipping diffusion for tiles with min dimension < {skip_threshold}px (preserves original details)')
+                                self._logged_skip = True
+
                     # VARIABLE DENOISE: Check if this tile should be active at this timestep
-                    # Only applies to quadtree mode with denoise values
+                    # Only applies to quadtree mode with denoise values (and not skipped tiles)
                     tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
 
-                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                    if not tile_skipped and use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
                         # Calculate progress through denoising schedule (0 = start, 1 = end)
                         sigmas = self.sigmas
                         ts_in = find_nearest(t_in[0], sigmas)
@@ -1294,6 +1319,7 @@ class TiledDiffusion():
                                 "enable_overlap": ("BOOLEAN", {"default": False, "tooltip": "Enable tile overlap for smoother blending. Currently experimental."}),
                                 "tile_overlap": ("INT", {"default": 16*opt_f, "min": opt_f, "max": 256*opt_f, "step": opt_f, "tooltip": "Overlap between tiles in pixels (image space). Minimum 8px (1px latent). Gets divided by 8 for latent space."}),
                                 "tile_batch_size": ("INT", {"default": 4, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                                "skip_diffusion_below": ("INT", {"default": 0, "min": 0, "max": 512, "step": 8, "tooltip": "Skip diffusion for tiles smaller than this size in pixels (0 = disabled). Preserves original details for small tiles. Must be multiple of 8 for VAE compatibility."}),
                             }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -1310,9 +1336,10 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, quadtree, enable_overlap, tile_overlap, tile_batch_size):
+    def apply(self, model: ModelPatcher, method, quadtree, enable_overlap, tile_overlap, tile_batch_size, skip_diffusion_below):
 
-        print(f'[Quadtree Diffusion]: Overlap: {"enabled" if enable_overlap else "disabled"}{f" ({tile_overlap}px)" if enable_overlap else ""}')
+        skip_enabled = skip_diffusion_below > 0
+        print(f'[Quadtree Diffusion]: Overlap: {"enabled" if enable_overlap else "disabled"}{f" ({tile_overlap}px)" if enable_overlap else ""}, Skip: {"enabled" if skip_enabled else "disabled"}{f" (<{skip_diffusion_below}px)" if skip_enabled else ""}')
 
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
@@ -1330,12 +1357,13 @@ class TiledDiffusion():
         compression = 4 if "CASCADE" in str(model.model.model_type) else 8
         self.impl.compression = compression
 
-        # Store quadtree structure, overlap, and batch size
+        # Store quadtree structure, overlap, batch size, and skip threshold
         self.impl.use_quadtree = True
         self.impl.quadtree_from_visualizer = quadtree
         self.impl.enable_overlap = enable_overlap
         self.impl.tile_overlap = (tile_overlap // compression) if enable_overlap else 0  # Convert to latent space or disable
         self.impl.tile_batch_size = tile_batch_size
+        self.impl.skip_diffusion_below = skip_diffusion_below  # Store in pixel space, we'll check during diffusion
 
         # self.impl.init_grid_bbox(tile_width, tile_height, tile_overlap, tile_batch_size)
         # # init everything done, perform sanity check & pre-computations
