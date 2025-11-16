@@ -387,65 +387,60 @@ class AbstractDiffusion:
             # Note: Visualizer operates in image space (8x larger), so we need to scale coordinates
             leaves = visualizer_quadtree['leaves']
 
-            # FILTER OUT-OF-BOUNDS LEAVES using actual runtime dimensions
-            # Remove leaves that are completely outside the latent image bounds
-            # This prevents coverage gaps and empty tensor extraction
+            # CROP EDGE TILES TO IMAGE BOUNDS using actual runtime dimensions
+            # The quadtree creates a square root that extends beyond rectangular images
+            # Instead of filtering, crop edge tiles to create rectangular tiles at boundaries
             original_leaf_count = len(leaves)
 
-            # Filter out-of-bounds leaves, accounting for overlap that will be added later
-            # A leaf should be KEPT if its tile (after adding overlap) overlaps with the image
-            # Tile position after overlap: (leaf.x // 8 - overlap, leaf.y // 8 - overlap)
-            # Tile end after overlap: (leaf.x // 8 + leaf.w // 8 + overlap, leaf.y // 8 + leaf.h // 8 + overlap)
-            # Keep if: tile_start < image_dimension AND tile_end > 0
+            cropped_leaves = []
+            filtered_count = 0
+            cropped_count = 0
 
-            filtered_leaves = []
-            kept_leaves = []
             for leaf in leaves:
                 # Calculate CORE bounds (without overlap) in latent space
                 core_start_x = leaf.x // 8
                 core_start_y = leaf.y // 8
-                core_end_x = leaf.x // 8 + leaf.w // 8
-                core_end_y = leaf.y // 8 + leaf.h // 8
+                core_end_x = (leaf.x + leaf.w) // 8
+                core_end_y = (leaf.y + leaf.h) // 8
 
-                # Calculate tile bounds with overlap
-                tile_start_x = core_start_x - overlap
-                tile_start_y = core_start_y - overlap
-                tile_end_x = core_end_x + overlap
-                tile_end_y = core_end_y + overlap
+                # Check if core overlaps with latent image at all
+                if core_start_x >= self.w or core_end_x <= 0 or core_start_y >= self.h or core_end_y <= 0:
+                    # Completely outside - skip it
+                    filtered_count += 1
+                    continue
 
-                # CRITICAL FIX: Filter based on core position, not just tile position
-                # The quadtree creates a square root that extends beyond the image, generating
-                # leaves outside the actual image bounds. We must filter these properly.
-                #
-                # Filter if:
-                # 1. Core is completely outside the image (core doesn't intersect image bounds), OR
-                # 2. Tile (with overlap) doesn't intersect the image at all
-                #
-                # Why check core? Because Gaussian weights are centered on the core. If the core
-                # is entirely outside, the weights for boundary pixels will be near-zero.
-                core_outside_x = core_start_x >= self.w or core_end_x <= 0
-                core_outside_y = core_start_y >= self.h or core_end_y <= 0
+                # Core overlaps - crop to latent image bounds
+                new_core_x = max(0, core_start_x)
+                new_core_y = max(0, core_start_y)
+                new_core_w = min(self.w, core_end_x) - new_core_x
+                new_core_h = min(self.h, core_end_y) - new_core_y
 
-                # Also filter if tile doesn't overlap at all (safety check)
-                tile_no_overlap_x = tile_start_x >= self.w or tile_end_x <= 0
-                tile_no_overlap_y = tile_start_y >= self.h or tile_end_y <= 0
+                # Convert back to image space for storage
+                new_x = new_core_x * 8
+                new_y = new_core_y * 8
+                new_w = new_core_w * 8
+                new_h = new_core_h * 8
 
-                should_filter = core_outside_x or core_outside_y or tile_no_overlap_x or tile_no_overlap_y
-
-                if should_filter:
-                    filtered_leaves.append(leaf)
+                # Check if this was actually cropped
+                if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
+                    cropped_count += 1
+                    # Create new cropped leaf
+                    from tiled_vae import QuadtreeNode
+                    cropped_leaf = QuadtreeNode(new_x, new_y, new_w, new_h, leaf.depth)
+                    cropped_leaf.variance = leaf.variance
+                    cropped_leaf.denoise = leaf.denoise
+                    cropped_leaves.append(cropped_leaf)
                 else:
-                    kept_leaves.append(leaf)
+                    # Keep original
+                    cropped_leaves.append(leaf)
 
-            leaves = kept_leaves
+            leaves = cropped_leaves
 
-            if len(filtered_leaves) > 0:
-                print(f'[Quadtree Diffusion]: Filtered {len(filtered_leaves)} out-of-bounds leaves (using runtime dimensions {self.w}x{self.h} latent)')
+            if filtered_count > 0 or cropped_count > 0:
+                print(f'[Quadtree Diffusion]: Filtered {filtered_count} fully out-of-bounds leaves, cropped {cropped_count} edge tiles (latent: {self.w}x{self.h})')
 
-                # CRITICAL FIX: Reassign denoise values after filtering
-                # The original denoise values were calculated including filtered leaves,
-                # so the largest filtered tile had min_denoise. After filtering, we need
-                # to reassign so the largest REMAINING tile gets min_denoise.
+                # Reassign denoise values after cropping
+                # The cropped tiles have different areas, so we need to recalculate
                 if len(leaves) > 0:
                     min_denoise = visualizer_quadtree['min_denoise']
                     max_denoise = visualizer_quadtree['max_denoise']
@@ -453,14 +448,13 @@ class AbstractDiffusion:
                     # Find new max area among kept leaves only
                     max_tile_area = max(leaf.w * leaf.h for leaf in leaves)
 
-                    # Reassign denoise values
+                    # Reassign denoise values based on new areas
                     for leaf in leaves:
                         tile_area = leaf.w * leaf.h
                         size_ratio = tile_area / max_tile_area
                         leaf.denoise = min_denoise + (max_denoise - min_denoise) * (1.0 - size_ratio)
 
-                    print(f'[Quadtree Diffusion]: Reassigned denoise values after filtering')
-                    print(f'[Quadtree Diffusion]: New denoise range: {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
+                    print(f'[Quadtree Diffusion]: Reassigned denoise values: {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
 
             bbox_list = []
             for idx, leaf in enumerate(leaves):
@@ -468,16 +462,12 @@ class AbstractDiffusion:
                 core_x, core_y = leaf.x // 8, leaf.y // 8
                 core_w, core_h = leaf.w // 8, leaf.h // 8
 
-                # CRITICAL: Keep tiles SQUARE even with overlap
-                # Don't clamp to image boundaries - instead, we'll pad during extraction
-                # Expand by overlap on all sides symmetrically
+                # Add overlap symmetrically on all sides
+                # Most tiles stay square, but edge tiles may be rectangular after cropping
                 x = core_x - overlap
                 y = core_y - overlap
                 w = core_w + 2 * overlap
                 h = core_h + 2 * overlap
-
-                # Tiles MUST remain square (w == h) for Approach A
-                assert w == h, f"Tile not square after overlap: {w}x{h} at ({x},{y})"
 
                 bbox = BBox(x, y, w, h)
                 bbox.denoise = leaf.denoise

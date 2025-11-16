@@ -338,20 +338,9 @@ class QuadtreeBuilder:
         # Get leaf nodes
         leaves = self.get_leaf_nodes(root)
 
-        # CRITICAL VALIDATION: Ensure all leaves are square
-        # This is required for Approach A to work correctly
-        non_square_leaves = []
-        for leaf in leaves:
-            if leaf.w != leaf.h:
-                non_square_leaves.append((leaf.x, leaf.y, leaf.w, leaf.h))
-
-        if non_square_leaves:
-            error_msg = f"Found {len(non_square_leaves)} non-square leaves:\n"
-            for x, y, w, h in non_square_leaves[:5]:  # Show first 5
-                error_msg += f"  - Position ({x}, {y}): {w}x{h}\n"
-            raise AssertionError(error_msg)
-
-        print(f'[Quadtree Builder]: ✓ All {len(leaves)} leaf nodes are square')
+        # IMPORTANT: Most leaves are square from quadtree subdivision
+        # Edge tiles may become rectangular after cropping to image bounds (handled later)
+        print(f'[Quadtree Builder]: Built quadtree with {len(leaves)} leaf nodes')
 
         return root, leaves
 
@@ -1358,23 +1347,43 @@ class QuadtreeVisualizer:
             )
             root, leaves = builder.build(img_tensor)
 
-            # FILTER OUT-OF-BOUNDS LEAVES (same logic as diffusion step)
+            # CROP EDGE TILES TO IMAGE BOUNDS
             # The quadtree creates a square root that extends beyond rectangular images
-            # Filter leaves whose core is completely outside the image bounds
+            # Instead of filtering, crop edge tiles to create rectangular tiles at boundaries
             original_leaf_count = len(leaves)
-            filtered_leaves = []
+            cropped_leaves = []
+            filtered_count = 0
+            cropped_count = 0
+
             for leaf in leaves:
-                # Check if core overlaps with actual image bounds
-                core_outside_x = leaf.x >= w or (leaf.x + leaf.w) <= 0
-                core_outside_y = leaf.y >= h or (leaf.y + leaf.h) <= 0
+                # Check if tile overlaps with image at all
+                if leaf.x >= w or (leaf.x + leaf.w) <= 0 or leaf.y >= h or (leaf.y + leaf.h) <= 0:
+                    # Completely outside - skip it
+                    filtered_count += 1
+                    continue
 
-                if not (core_outside_x or core_outside_y):
-                    filtered_leaves.append(leaf)
+                # Tile overlaps - crop to image bounds
+                new_x = max(0, leaf.x)
+                new_y = max(0, leaf.y)
+                new_w = min(w, leaf.x + leaf.w) - new_x
+                new_h = min(h, leaf.y + leaf.h) - new_y
 
-            leaves = filtered_leaves
+                # Check if this was actually cropped
+                if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
+                    cropped_count += 1
+                    # Create new cropped leaf
+                    cropped_leaf = QuadtreeNode(new_x, new_y, new_w, new_h, leaf.depth)
+                    cropped_leaf.variance = leaf.variance
+                    cropped_leaf.denoise = leaf.denoise
+                    cropped_leaves.append(cropped_leaf)
+                else:
+                    # Keep original
+                    cropped_leaves.append(leaf)
 
-            if len(leaves) < original_leaf_count:
-                print(f'[Quadtree Visualizer]: Filtered {original_leaf_count - len(leaves)} out-of-bounds leaves (showing only tiles that overlap {w}x{h} image)')
+            leaves = cropped_leaves
+
+            if filtered_count > 0 or cropped_count > 0:
+                print(f'[Quadtree Visualizer]: Filtered {filtered_count} fully out-of-bounds leaves, cropped {cropped_count} edge tiles to fit {w}x{h} image')
 
             # Convert image to numpy for drawing
             img_np = (img.cpu().numpy() * 255).astype(np.uint8)
