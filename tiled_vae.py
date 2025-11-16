@@ -133,9 +133,9 @@ class QuadtreeNode:
 
 
 class QuadtreeBuilder:
-    """Builds a quadtree from image/latent content based on variance"""
+    """Builds a quadtree from image/latent content based on RGB Euclidean distance variance"""
     def __init__(self,
-                 content_threshold: float = 0.05,
+                 content_threshold: float = 0.03,
                  max_depth: int = 4,
                  min_tile_size: int = 256,
                  min_denoise: float = 0.0,
@@ -145,9 +145,8 @@ class QuadtreeBuilder:
 
         Args:
             content_threshold: Variance threshold to trigger subdivision
-                              (0.005-0.25, equivalent to Processing's 5-50 on 0-255 scale)
             max_depth: Maximum recursion depth
-            min_tile_size: Minimum tile size in pixels (won't subdivide below this)
+            min_tile_size: Minimum tile size in pixels
             min_denoise: Denoise value for largest tiles
             max_denoise: Denoise value for smallest tiles
         """
@@ -156,62 +155,62 @@ class QuadtreeBuilder:
         self.min_tile_size = min_tile_size
         self.min_denoise = min_denoise
         self.max_denoise = max_denoise
-        self.max_tile_area = 0  # Track maximum tile area for denoise calculation
+        self.max_tile_area = 0
 
     def calculate_variance(self, tensor: torch.Tensor, x: int, y: int, w: int, h: int) -> float:
         """
-        Calculate variance (content complexity) for a region
-        Uses mean absolute deviation from average color (matching reference implementation)
+        Calculate variance as mean absolute deviation from mean color
+        Reference: avg(|R-R_avg| + |G-G_avg| + |B-B_avg|)
 
         Args:
             tensor: Input tensor (B, C, H, W) or (C, H, W)
             x, y, w, h: Region coordinates
 
         Returns:
-            Variance value (average distance from mean color)
+            Mean absolute deviation
         """
-        # Handle both batched and unbatched tensors
+        # Extract region
         if tensor.dim() == 4:
             region = tensor[:, :, y:y+h, x:x+w]
+            channel_dim = 1
         else:
             region = tensor[:, y:y+h, x:x+w]
+            channel_dim = 0
 
-        # Ensure region has valid size
         if region.numel() == 0:
             return 0.0
 
-        # Calculate average color for this region
-        avg_color = torch.mean(region, dim=(-2, -1), keepdim=True)
+        # Compute mean color across spatial dimensions
+        mean_color = torch.mean(region, dim=(-2, -1), keepdim=True)
 
-        # Calculate mean absolute deviation
-        # This is "the average distance between each pixel's color and the region's average color"
-        # matching the reference implementation
-        deviations = torch.abs(region - avg_color)
-        mean_absolute_deviation = torch.mean(deviations).item()
+        # Mean absolute deviation (matches reference implementation)
+        deviations = torch.abs(region - mean_color)
+        variance = torch.mean(deviations).item()
 
-        return mean_absolute_deviation
+        return variance
 
     def should_subdivide(self, node: QuadtreeNode, variance: float) -> bool:
-        """
-        Determine if a node should be subdivided
-
-        Args:
-            node: Current node
-            variance: Calculated variance for this node
-
-        Returns:
-            True if should subdivide, False otherwise
-        """
+        """Determine if a node should be subdivided"""
         # Don't subdivide if at max depth
         if node.depth >= self.max_depth:
             return False
 
         # Don't subdivide if tile would be too small
-        # Also ensure child tiles would be at least 8 pixels (VAE requirement)
         half_w_aligned = ((node.w // 2) // 8) * 8
         half_h_aligned = ((node.h // 2) // 8) * 8
 
         if half_w_aligned < max(self.min_tile_size, 8) or half_h_aligned < max(self.min_tile_size, 8):
+            return False
+
+        # NEW: Check 8-pixel alignment for BOTH halves and remainders
+        # This prevents creating children that violate VAE's 8-pixel alignment requirement
+        remainder_w = node.w - half_w_aligned
+        remainder_h = node.h - half_h_aligned
+
+        # All children must be >=8 and multiples of 8
+        if (half_w_aligned < 8 or half_h_aligned < 8 or
+            remainder_w < 8 or remainder_h < 8 or
+            remainder_w % 8 != 0 or remainder_h % 8 != 0):
             return False
 
         # Subdivide if variance is above threshold
@@ -235,18 +234,15 @@ class QuadtreeBuilder:
             else:
                 _, h, w = tensor.shape
 
-            # APPROACH A: Create SQUARE root covering entire image
-            # This ensures all children will be square (quadtree property)
+            # Create square root covering entire image (power-of-2 multiple of 8)
             root_size = max(w, h)
 
-            # Ensure root size is aligned to 16-pixel boundaries
-            # WHY 16: VAE needs 8x (divisible by 8), but square subdivision requires 16x
-            # Square subdivision: parent N splits to children N/2 and N/2
-            # For squares: N/2 must equal N - N/2, so N must be divisible by 16
-            root_size = ((root_size + 15) // 16) * 16
+            if root_size <= 8:
+                root_size = 8
+            else:
+                n = math.ceil(math.log2(root_size / 8))
+                root_size = 8 * (2 ** n)
 
-            # Create square root node at origin (0, 0)
-            # This square will cover the entire image and extend beyond if needed
             root_node = QuadtreeNode(0, 0, root_size, root_size, 0)
 
         # Calculate variance for this node
@@ -265,16 +261,7 @@ class QuadtreeBuilder:
         return root_node
 
     def get_leaf_nodes(self, node: QuadtreeNode, leaves: list = None) -> list:
-        """
-        Get all leaf nodes (tiles) from the tree
-
-        Args:
-            node: Root node to start from
-            leaves: Accumulator list (created automatically)
-
-        Returns:
-            List of all leaf nodes
-        """
+        """Get all leaf nodes from the tree"""
         if leaves is None:
             leaves = []
 
@@ -288,28 +275,21 @@ class QuadtreeBuilder:
 
     def assign_denoise_values(self, root_node: QuadtreeNode):
         """
-        Assign denoise values to all leaf nodes based on tile size
+        Assign denoise values based on tile size
         Larger tiles → lower denoise (preserve)
         Smaller tiles → higher denoise (regenerate)
-
-        Args:
-            root_node: Root of the quadtree
         """
-        # First pass: find maximum tile area
         leaves = self.get_leaf_nodes(root_node)
         self.max_tile_area = max(leaf.w * leaf.h for leaf in leaves)
 
-        # Second pass: assign denoise values
         for leaf in leaves:
             tile_area = leaf.w * leaf.h
-            size_ratio = tile_area / self.max_tile_area  # 0.0 (smallest) to 1.0 (largest)
-
-            # Inverse relationship: large tiles get low denoise, small tiles get high denoise
+            size_ratio = tile_area / self.max_tile_area
             leaf.denoise = self.min_denoise + (self.max_denoise - self.min_denoise) * (1.0 - size_ratio)
 
     def build(self, tensor: torch.Tensor) -> tuple:
         """
-        Build complete quadtree and return leaf nodes with denoise values
+        Build complete quadtree and return leaf nodes
 
         Args:
             tensor: Input tensor to analyze
@@ -317,29 +297,11 @@ class QuadtreeBuilder:
         Returns:
             (root_node, leaf_nodes) tuple
         """
-        # Build the tree
         root = self.build_tree(tensor)
-
-        # Assign denoise values
         self.assign_denoise_values(root)
-
-        # Get leaf nodes
         leaves = self.get_leaf_nodes(root)
 
-        # CRITICAL VALIDATION: Ensure all leaves are square
-        # This is required for Approach A to work correctly
-        non_square_leaves = []
-        for leaf in leaves:
-            if leaf.w != leaf.h:
-                non_square_leaves.append((leaf.x, leaf.y, leaf.w, leaf.h))
-
-        if non_square_leaves:
-            error_msg = f"Found {len(non_square_leaves)} non-square leaves:\n"
-            for x, y, w, h in non_square_leaves[:5]:  # Show first 5
-                error_msg += f"  - Position ({x}, {y}): {w}x{h}\n"
-            raise AssertionError(error_msg)
-
-        print(f'[Quadtree Builder]: ✓ All {len(leaves)} leaf nodes are square')
+        print(f'[Quadtree]: Built quadtree with {len(leaves)} tiles')
 
         return root, leaves
 
@@ -715,7 +677,7 @@ class GroupNormParam:
 class VAEHook:
 
     def __init__(self, net, tile_size, is_decoder:bool, fast_decoder:bool, fast_encoder:bool, color_fix:bool, to_gpu:bool=False,
-                 use_quadtree:bool=False, content_threshold:float=0.05, max_depth:int=4, min_tile_size:int=128):
+                 use_quadtree:bool=False, content_threshold:float=0.03, max_depth:int=4, min_tile_size:int=128):
         self.net = net                  # encoder | decoder
         self.tile_size = tile_size
         self.is_decoder = is_decoder
@@ -849,8 +811,6 @@ class VAEHook:
 
         tile_input_bboxes, tile_output_bboxes = [], []
 
-        print(f'[Quadtree VAE]: Built adaptive quadtree with {len(leaves)} tiles (max_depth={self.max_depth}, threshold={self.content_threshold})')
-
         for leaf in leaves:
             # Quadtree leaves are in the current tensor's space (h x w)
             # For decoder: latent space. For encoder: image space.
@@ -880,18 +840,6 @@ class VAEHook:
                 min(h, core_bbox[3] + pad),
             ]
             tile_input_bboxes.append(input_bbox_padded)
-
-        # Print statistics
-        tile_sizes = [leaf.w * leaf.h for leaf in leaves]
-        print(f'[Quadtree VAE]: Tile sizes range from {min(tile_sizes)} to {max(tile_sizes)} pixels')
-        print(f'[Quadtree VAE]: Variance range: {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
-
-        # Check if tiles are actually adaptive (different sizes)
-        unique_sizes = set((leaf.w, leaf.h) for leaf in leaves)
-        if len(unique_sizes) == 1:
-            print(f'[Quadtree VAE]: WARNING - All tiles are the same size! Quadtree may not be working.')
-        else:
-            print(f'[Quadtree VAE]: ✓ Found {len(unique_sizes)} different tile sizes - quadtree IS adaptive')
 
         return tile_input_bboxes, tile_output_bboxes
 
@@ -1148,7 +1096,7 @@ class TiledVAE:
 
         # Extract quadtree parameters (with defaults if not provided)
         use_quadtree = kwargs.get('use_quadtree', False)
-        content_threshold = kwargs.get('content_threshold', 0.05)
+        content_threshold = kwargs.get('content_threshold', 0.03)
         max_depth = kwargs.get('max_depth', 4)
         min_tile_size = kwargs.get('min_tile_size', 128)
 
@@ -1261,25 +1209,25 @@ class QuadtreeVisualizer:
             "required": {
                 "image": ("IMAGE",),
                 "content_threshold": ("FLOAT", {
-                    "default": 0.05,
-                    "min": 0.01,
+                    "default": 0.03,
+                    "min": 0.001,
                     "max": 0.5,
-                    "step": 0.01,
-                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas. Try 0.01-0.05 for balanced, 0.05-0.1 for conservative subdivision, 0.1+ for minimal subdivision."
+                    "step": 0.001,
+                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas."
                 }),
                 "max_depth": ("INT", {
-                    "default": 5,
+                    "default": 4,
                     "min": 1,
-                    "max": 10,
+                    "max": 8,
                     "step": 1,
-                    "tooltip": "Maximum subdivision depth. Higher = smaller minimum tiles. 5 = up to 32x32 grid, 6 = 64x64 grid"
+                    "tooltip": "Maximum quadtree depth"
                 }),
                 "min_tile_size": ("INT", {
                     "default": 256,
                     "min": 64,
-                    "max": 2048,
-                    "step": 16,
-                    "tooltip": "Minimum tile size in pixels (image space). 256-512px recommended for most cases. Smaller = more tiles but slower."
+                    "max": 1024,
+                    "step": 8,
+                    "tooltip": "Minimum tile size in pixels"
                 }),
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
@@ -1295,7 +1243,13 @@ class QuadtreeVisualizer:
                     "step": 0.05,
                     "tooltip": "Denoise strength for smallest tiles (high complexity areas). Should be >= min_denoise"
                 }),
-                "line_thickness": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "line_thickness": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "tooltip": "Thickness of quadtree boundary lines"
+                }),
             }
         }
 
@@ -1303,7 +1257,8 @@ class QuadtreeVisualizer:
     FUNCTION = "visualize"
     CATEGORY = "_for_testing/quadtree"
 
-    def visualize(self, image, content_threshold, max_depth, min_tile_size, min_denoise, max_denoise, line_thickness):
+    def visualize(self, image, content_threshold, max_depth, min_tile_size,
+                  min_denoise, max_denoise, line_thickness):
         """
         Visualize the quadtree structure overlaid on the input image
 
@@ -1343,6 +1298,44 @@ class QuadtreeVisualizer:
             )
             root, leaves = builder.build(img_tensor)
 
+            # CROP EDGE TILES TO IMAGE BOUNDS
+            # The quadtree creates a square root that extends beyond rectangular images
+            # Instead of filtering, crop edge tiles to create rectangular tiles at boundaries
+            original_leaf_count = len(leaves)
+            cropped_leaves = []
+            filtered_count = 0
+            cropped_count = 0
+
+            for leaf in leaves:
+                # Check if tile overlaps with image at all
+                if leaf.x >= w or (leaf.x + leaf.w) <= 0 or leaf.y >= h or (leaf.y + leaf.h) <= 0:
+                    # Completely outside - skip it
+                    filtered_count += 1
+                    continue
+
+                # Tile overlaps - crop to image bounds
+                new_x = max(0, leaf.x)
+                new_y = max(0, leaf.y)
+                new_w = min(w, leaf.x + leaf.w) - new_x
+                new_h = min(h, leaf.y + leaf.h) - new_y
+
+                # Check if this was actually cropped
+                if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
+                    cropped_count += 1
+                    # Create new cropped leaf
+                    cropped_leaf = QuadtreeNode(new_x, new_y, new_w, new_h, leaf.depth)
+                    cropped_leaf.variance = leaf.variance
+                    cropped_leaf.denoise = leaf.denoise
+                    cropped_leaves.append(cropped_leaf)
+                else:
+                    # Keep original
+                    cropped_leaves.append(leaf)
+
+            leaves = cropped_leaves
+
+            if filtered_count > 0 or cropped_count > 0:
+                print(f'[Quadtree Visualizer]: Filtered {filtered_count} fully out-of-bounds leaves, cropped {cropped_count} edge tiles to fit {w}x{h} image')
+
             # Convert image to numpy for drawing
             img_np = (img.cpu().numpy() * 255).astype(np.uint8)
 
@@ -1377,10 +1370,8 @@ class QuadtreeVisualizer:
         output = torch.stack(results, dim=0)
 
         # Print statistics
-        print(f'[Quadtree Visualizer]: Built quadtree with {len(leaves)} tiles')
-        print(f'[Quadtree Visualizer]: Tile sizes range from {min(l.w * l.h for l in leaves)} to {max(l.w * l.h for l in leaves)} pixels')
-        print(f'[Quadtree Visualizer]: Min tile dimensions: {min(l.w for l in leaves)}x{min(l.h for l in leaves)} pixels')
-        print(f'[Quadtree Visualizer]: Max tile dimensions: {max(l.w for l in leaves)}x{max(l.h for l in leaves)} pixels')
+        print(f'[Quadtree Visualizer]: Built quadtree with {len(leaves)} tiles (after filtering)')
+        print(f'[Quadtree Visualizer]: Tile dimensions range from {min(l.w for l in leaves)}x{min(l.h for l in leaves)} to {max(l.w for l in leaves)}x{max(l.h for l in leaves)}')
         print(f'[Quadtree Visualizer]: Variance values range from {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
         print(f'[Quadtree Visualizer]: Denoise values range from {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
         print(f'[Quadtree Visualizer]: Max depth reached: {max(l.depth for l in leaves)}')
