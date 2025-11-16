@@ -1379,7 +1379,7 @@ class QuadtreeVisualizer:
             'root': root,
             'leaves': leaves,
             'content_threshold': content_threshold,
-            'max_depth': max_depth,
+            'max_tile_size': max_tile_size,
             'min_tile_size': min_tile_size,
             'min_denoise': min_denoise,
             'max_denoise': max_denoise,
