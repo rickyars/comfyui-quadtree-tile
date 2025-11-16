@@ -159,15 +159,15 @@ class QuadtreeBuilder:
 
     def calculate_variance(self, tensor: torch.Tensor, x: int, y: int, w: int, h: int) -> float:
         """
-        Calculate variance as average Euclidean distance from mean color
-        Reference: avg(sqrt((R-R_avg)² + (G-G_avg)² + (B-B_avg)²))
+        Calculate variance as mean absolute deviation from mean color
+        Reference: avg(|R-R_avg| + |G-G_avg| + |B-B_avg|)
 
         Args:
             tensor: Input tensor (B, C, H, W) or (C, H, W)
             x, y, w, h: Region coordinates
 
         Returns:
-            Average Euclidean distance in RGB space
+            Mean absolute deviation
         """
         # Extract region
         if tensor.dim() == 4:
@@ -183,13 +183,9 @@ class QuadtreeBuilder:
         # Compute mean color across spatial dimensions
         mean_color = torch.mean(region, dim=(-2, -1), keepdim=True)
 
-        # Euclidean distance in RGB space for each pixel
-        diff = region - mean_color
-        squared_dist = torch.sum(diff ** 2, dim=channel_dim)
-        euclidean_dist = torch.sqrt(squared_dist)
-
-        # Average over all pixels (and batch if present)
-        variance = torch.mean(euclidean_dist).item()
+        # Mean absolute deviation (matches reference implementation)
+        deviations = torch.abs(region - mean_color)
+        variance = torch.mean(deviations).item()
 
         return variance
 
