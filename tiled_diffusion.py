@@ -416,10 +416,28 @@ class AbstractDiffusion:
                 new_core_w = min(self.w, core_end_x) - new_core_x
                 new_core_h = min(self.h, core_end_y) - new_core_y
 
-                # Minimum dimension check - edge tiles must be at least 16 latent pixels (128 pixels)
-                # Smaller tiles are too small for effective diffusion and create instability
-                MIN_EDGE_TILE_DIM_LATENT = 16
-                if new_core_w < MIN_EDGE_TILE_DIM_LATENT or new_core_h < MIN_EDGE_TILE_DIM_LATENT:
+                # For edge tiles that would be too small, extend them inward instead of dropping
+                # This maintains coverage while avoiding degenerate tiny tiles
+                MIN_EDGE_TILE_DIM_LATENT = 16  # 128 pixels
+
+                if new_core_w < MIN_EDGE_TILE_DIM_LATENT:
+                    # Try to extend inward (reduce new_core_x) to reach minimum
+                    shortage = MIN_EDGE_TILE_DIM_LATENT - new_core_w
+                    can_extend = min(shortage, new_core_x)  # Can't extend past x=0
+                    if can_extend > 0:
+                        new_core_x -= can_extend
+                        new_core_w += can_extend
+
+                if new_core_h < MIN_EDGE_TILE_DIM_LATENT:
+                    # Try to extend inward (reduce new_core_y) to reach minimum
+                    shortage = MIN_EDGE_TILE_DIM_LATENT - new_core_h
+                    can_extend = min(shortage, new_core_y)  # Can't extend past y=0
+                    if can_extend > 0:
+                        new_core_y -= can_extend
+                        new_core_h += can_extend
+
+                # Only filter truly degenerate tiles (< 8 latent pixels = 64px)
+                if new_core_w < 8 or new_core_h < 8:
                     filtered_count += 1
                     continue
 
@@ -473,10 +491,6 @@ class AbstractDiffusion:
                 # Cap overlap to prevent excessively large tiles that could freeze ComfyUI
                 # Overlap should not exceed 50% of the smaller core dimension
                 max_safe_overlap = min(core_w // 2, core_h // 2, overlap)
-                if max_safe_overlap < overlap:
-                    # Only warn once for first tile with capped overlap
-                    if idx == 0 or overlap != max_safe_overlap:
-                        print(f'[Quadtree Diffusion]: Capping overlap from {overlap} to {max_safe_overlap} for {core_w}x{core_h} tile to prevent excessive size')
 
                 # Add overlap symmetrically on all sides
                 # Most tiles stay square, but edge tiles may be rectangular after cropping
@@ -485,10 +499,17 @@ class AbstractDiffusion:
                 w = core_w + 2 * max_safe_overlap
                 h = core_h + 2 * max_safe_overlap
 
-                # Warn about very large tiles that may cause performance issues
-                MAX_TILE_DIM_LATENT = 192  # 1536 pixels
-                if w > MAX_TILE_DIM_LATENT or h > MAX_TILE_DIM_LATENT:
-                    print(f'[Quadtree Diffusion]: Warning - Large tile: {w*8}x{h*8}px (latent: {w}x{h}). Consider reducing max_depth or increasing min_tile_size')
+                # Cap individual dimensions to prevent freezing (max 256 latent = 2048 pixels)
+                # Very large tiles can cause OOM or freezing
+                MAX_TILE_DIM_LATENT = 256
+                if w > MAX_TILE_DIM_LATENT:
+                    excess = w - MAX_TILE_DIM_LATENT
+                    x += excess // 2  # Trim equally from both sides
+                    w = MAX_TILE_DIM_LATENT
+                if h > MAX_TILE_DIM_LATENT:
+                    excess = h - MAX_TILE_DIM_LATENT
+                    y += excess // 2  # Trim equally from both sides
+                    h = MAX_TILE_DIM_LATENT
 
                 bbox = BBox(x, y, w, h)
                 bbox.denoise = leaf.denoise

@@ -1319,26 +1319,43 @@ class QuadtreeVisualizer:
                 new_w = min(w, leaf.x + leaf.w) - new_x
                 new_h = min(h, leaf.y + leaf.h) - new_y
 
-                # Round dimensions UP to nearest multiple of 8 for proper latent space alignment
-                # This prevents coverage gaps when converting between image and latent space
-                new_w = ((new_w + 7) // 8) * 8
-                new_h = ((new_h + 7) // 8) * 8
-
-                # Clamp to image bounds to avoid extending beyond
-                new_w = min(new_w, w - new_x)
-                new_h = min(new_h, h - new_y)
-
-                # Minimum dimension check - edge tiles must be at least 128 pixels
-                # Smaller tiles are too small for effective diffusion and create instability
+                # For edge tiles that would be too small, extend them inward instead of dropping
+                # This maintains coverage while avoiding degenerate tiny tiles
                 MIN_EDGE_TILE_DIM = 128
-                if new_w < MIN_EDGE_TILE_DIM or new_h < MIN_EDGE_TILE_DIM:
+                extended = False
+
+                if new_w < MIN_EDGE_TILE_DIM:
+                    # Try to extend inward (reduce new_x) to reach minimum
+                    shortage = MIN_EDGE_TILE_DIM - new_w
+                    can_extend = min(shortage, new_x)  # Can't extend past x=0
+                    if can_extend > 0:
+                        new_x -= can_extend
+                        new_w += can_extend
+                        extended = True
+
+                if new_h < MIN_EDGE_TILE_DIM:
+                    # Try to extend inward (reduce new_y) to reach minimum
+                    shortage = MIN_EDGE_TILE_DIM - new_h
+                    can_extend = min(shortage, new_y)  # Can't extend past y=0
+                    if can_extend > 0:
+                        new_y -= can_extend
+                        new_h += can_extend
+                        extended = True
+
+                # Ensure dimensions are multiples of 8 for latent space alignment
+                # Round to nearest multiple of 8 (not up, to avoid extending beyond bounds)
+                new_w = (new_w // 8) * 8
+                new_h = (new_h // 8) * 8
+
+                # After rounding, if still too small, skip only if truly degenerate (< 64px)
+                if new_w < 64 or new_h < 64:
                     filtered_count += 1
                     continue
 
-                # Check if this was actually cropped
+                # Check if this was actually cropped or extended
                 if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
                     cropped_count += 1
-                    # Create new cropped leaf
+                    # Create new cropped/extended leaf
                     cropped_leaf = QuadtreeNode(new_x, new_y, new_w, new_h, leaf.depth)
                     cropped_leaf.variance = leaf.variance
                     cropped_leaf.denoise = leaf.denoise
