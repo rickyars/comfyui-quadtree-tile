@@ -894,8 +894,11 @@ class VAEHook:
             tile_input_bboxes.append(input_bbox_padded)
 
         # Print statistics
-        tile_sizes = [leaf.w * leaf.h for leaf in leaves]
-        print(f'[Quadtree VAE]: Tile sizes range from {min(tile_sizes)} to {max(tile_sizes)} pixels')
+        min_w = min(leaf.w for leaf in leaves)
+        min_h = min(leaf.h for leaf in leaves)
+        max_w = max(leaf.w for leaf in leaves)
+        max_h = max(leaf.h for leaf in leaves)
+        print(f'[Quadtree VAE]: Tile dimensions range from {min_w}x{min_h} to {max_w}x{max_h} (image space)')
         print(f'[Quadtree VAE]: Variance range: {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
 
         # Check if tiles are actually adaptive (different sizes)
@@ -1355,6 +1358,24 @@ class QuadtreeVisualizer:
             )
             root, leaves = builder.build(img_tensor)
 
+            # FILTER OUT-OF-BOUNDS LEAVES (same logic as diffusion step)
+            # The quadtree creates a square root that extends beyond rectangular images
+            # Filter leaves whose core is completely outside the image bounds
+            original_leaf_count = len(leaves)
+            filtered_leaves = []
+            for leaf in leaves:
+                # Check if core overlaps with actual image bounds
+                core_outside_x = leaf.x >= w or (leaf.x + leaf.w) <= 0
+                core_outside_y = leaf.y >= h or (leaf.y + leaf.h) <= 0
+
+                if not (core_outside_x or core_outside_y):
+                    filtered_leaves.append(leaf)
+
+            leaves = filtered_leaves
+
+            if len(leaves) < original_leaf_count:
+                print(f'[Quadtree Visualizer]: Filtered {original_leaf_count - len(leaves)} out-of-bounds leaves (showing only tiles that overlap {w}x{h} image)')
+
             # Convert image to numpy for drawing
             img_np = (img.cpu().numpy() * 255).astype(np.uint8)
 
@@ -1389,10 +1410,8 @@ class QuadtreeVisualizer:
         output = torch.stack(results, dim=0)
 
         # Print statistics
-        print(f'[Quadtree Visualizer]: Built quadtree with {len(leaves)} tiles')
-        print(f'[Quadtree Visualizer]: Tile sizes range from {min(l.w * l.h for l in leaves)} to {max(l.w * l.h for l in leaves)} pixels')
-        print(f'[Quadtree Visualizer]: Min tile dimensions: {min(l.w for l in leaves)}x{min(l.h for l in leaves)} pixels')
-        print(f'[Quadtree Visualizer]: Max tile dimensions: {max(l.w for l in leaves)}x{max(l.h for l in leaves)} pixels')
+        print(f'[Quadtree Visualizer]: Built quadtree with {len(leaves)} tiles (after filtering)')
+        print(f'[Quadtree Visualizer]: Tile dimensions range from {min(l.w for l in leaves)}x{min(l.h for l in leaves)} to {max(l.w for l in leaves)}x{max(l.h for l in leaves)}')
         print(f'[Quadtree Visualizer]: Variance values range from {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
         print(f'[Quadtree Visualizer]: Denoise values range from {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
         print(f'[Quadtree Visualizer]: Max depth reached: {max(l.depth for l in leaves)}')
