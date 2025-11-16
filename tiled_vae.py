@@ -136,7 +136,6 @@ class QuadtreeBuilder:
     """Builds a quadtree from image/latent content - MATCHES JavaScript implementation exactly"""
     def __init__(self,
                  content_threshold: float = 25.0,
-                 max_tile_size: int = 500,
                  min_tile_size: int = 4,
                  min_denoise: float = 0.0,
                  max_denoise: float = 1.0):
@@ -145,13 +144,11 @@ class QuadtreeBuilder:
 
         Args:
             content_threshold: Variance threshold (1-200, default 25) - MATCHES JavaScript
-            max_tile_size: Maximum tile size forcing subdivision (10-1000, default 500) - MATCHES JavaScript maxSize
             min_tile_size: Minimum tile size in pixels (1-50, default 4) - MATCHES JavaScript minSize
             min_denoise: Denoise value for largest tiles
             max_denoise: Denoise value for smallest tiles
         """
         self.content_threshold = content_threshold
-        self.max_tile_size = max_tile_size
         self.min_tile_size = min_tile_size
         self.min_denoise = min_denoise
         self.max_denoise = max_denoise
@@ -214,9 +211,8 @@ class QuadtreeBuilder:
     def should_subdivide(self, node: QuadtreeNode, variance: float) -> bool:
         """
         Determine if a node should be subdivided
-        EXACTLY matches JavaScript logic:
-          shouldSubdivide = (variation > threshold && w > minSize && h > minSize) ||
-                           (w > maxSize || h > maxSize)
+        EXACTLY matches JavaScript logic (without maxSize):
+          shouldSubdivide = variation > threshold && w > minSize && h > minSize
         """
         # Check if children would be too small (after 8-alignment)
         half_w = ((node.w // 2) // 8) * 8
@@ -232,14 +228,10 @@ class QuadtreeBuilder:
         if remainder_w % 8 != 0 or remainder_h % 8 != 0:
             return False
 
-        # JavaScript logic: subdivide if EITHER:
-        # 1. Color variation exceeds threshold AND region larger than minSize
-        # 2. Region larger than maxSize (force subdivision for balanced tree)
+        # JavaScript logic: subdivide if variation exceeds threshold AND region larger than minSize
         should_subdivide = (variance > self.content_threshold and
                            node.w > self.min_tile_size and
-                           node.h > self.min_tile_size) or \
-                          (node.w > self.max_tile_size or
-                           node.h > self.max_tile_size)
+                           node.h > self.min_tile_size)
 
         return should_subdivide
 
@@ -1243,13 +1235,6 @@ class QuadtreeVisualizer:
                     "step": 1.0,
                     "tooltip": "Variance threshold for subdivision (1-200, higher = fewer tiles). Matches JavaScript threshold."
                 }),
-                "max_tile_size": ("INT", {
-                    "default": 500,
-                    "min": 10,
-                    "max": 1000,
-                    "step": 10,
-                    "tooltip": "Maximum tile size - forces subdivision for balanced tree (like JavaScript maxSize)"
-                }),
                 "min_tile_size": ("INT", {
                     "default": 4,
                     "min": 1,
@@ -1285,7 +1270,7 @@ class QuadtreeVisualizer:
     FUNCTION = "visualize"
     CATEGORY = "_for_testing/quadtree"
 
-    def visualize(self, image, content_threshold, max_tile_size, min_tile_size,
+    def visualize(self, image, content_threshold, min_tile_size,
                   min_denoise, max_denoise, line_thickness):
         """
         Visualize the quadtree structure (MATCHES JavaScript implementation exactly)
@@ -1319,7 +1304,6 @@ class QuadtreeVisualizer:
             # Build quadtree (MATCHES JavaScript parameters exactly)
             builder = QuadtreeBuilder(
                 content_threshold=content_threshold,
-                max_tile_size=max_tile_size,
                 min_tile_size=min_tile_size,
                 min_denoise=min_denoise,
                 max_denoise=max_denoise
@@ -1367,7 +1351,7 @@ class QuadtreeVisualizer:
         print(f'[Quadtree Visualizer]: Tile dimensions range from {min(l.w for l in leaves)}x{min(l.h for l in leaves)} to {max(l.w for l in leaves)}x{max(l.h for l in leaves)}')
         print(f'[Quadtree Visualizer]: Variance values range from {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
         print(f'[Quadtree Visualizer]: Denoise values range from {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
-        print(f'[Quadtree Visualizer]: Max depth reached: {max(l.depth for l in leaves)} (no max_depth limit, uses max_tile_size={max_tile_size})')
+        print(f'[Quadtree Visualizer]: Max depth reached: {max(l.depth for l in leaves)} (no depth or size limits)')
 
         # Count tiles by depth to understand tree structure
         from collections import Counter
@@ -1379,7 +1363,6 @@ class QuadtreeVisualizer:
             'root': root,
             'leaves': leaves,
             'content_threshold': content_threshold,
-            'max_tile_size': max_tile_size,
             'min_tile_size': min_tile_size,
             'min_denoise': min_denoise,
             'max_denoise': max_denoise,
