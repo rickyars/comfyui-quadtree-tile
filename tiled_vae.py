@@ -133,25 +133,25 @@ class QuadtreeNode:
 
 
 class QuadtreeBuilder:
-    """Builds a quadtree from image/latent content based on RGB Euclidean distance variance"""
+    """Builds a quadtree from image/latent content - MATCHES JavaScript implementation exactly"""
     def __init__(self,
-                 content_threshold: float = 0.03,
-                 max_depth: int = 4,
-                 min_tile_size: int = 256,
+                 content_threshold: float = 25.0,
+                 max_tile_size: int = 500,
+                 min_tile_size: int = 4,
                  min_denoise: float = 0.0,
                  max_denoise: float = 1.0):
         """
-        Initialize quadtree builder
+        Initialize quadtree builder (matches JavaScript parameters exactly)
 
         Args:
-            content_threshold: Variance threshold to trigger subdivision
-            max_depth: Maximum recursion depth
-            min_tile_size: Minimum tile size in pixels
+            content_threshold: Variance threshold (1-200, default 25) - MATCHES JavaScript
+            max_tile_size: Maximum tile size forcing subdivision (10-1000, default 500) - MATCHES JavaScript maxSize
+            min_tile_size: Minimum tile size in pixels (1-50, default 4) - MATCHES JavaScript minSize
             min_denoise: Denoise value for largest tiles
             max_denoise: Denoise value for smallest tiles
         """
         self.content_threshold = content_threshold
-        self.max_depth = max_depth
+        self.max_tile_size = max_tile_size
         self.min_tile_size = min_tile_size
         self.min_denoise = min_denoise
         self.max_denoise = max_denoise
@@ -159,62 +159,89 @@ class QuadtreeBuilder:
 
     def calculate_variance(self, tensor: torch.Tensor, x: int, y: int, w: int, h: int) -> float:
         """
-        Calculate variance as mean absolute deviation from mean color
-        Reference: avg(|R-R_avg| + |G-G_avg| + |B-B_avg|)
+        Calculate variance EXACTLY like JavaScript implementation
+        Formula: sqrt(varR + varG + varB) where varX = E[X²] - E[X]²
 
         Args:
-            tensor: Input tensor (B, C, H, W) or (C, H, W)
+            tensor: Input tensor (B, C, H, W) or (C, H, W) - values in [0, 1]
             x, y, w, h: Region coordinates
 
         Returns:
-            Mean absolute deviation
+            Combined color variation (matches JavaScript analyzeRegion)
         """
         # Extract region
         if tensor.dim() == 4:
             region = tensor[:, :, y:y+h, x:x+w]
-            channel_dim = 1
         else:
             region = tensor[:, y:y+h, x:x+w]
-            channel_dim = 0
 
         if region.numel() == 0:
             return 0.0
 
-        # Compute mean color across spatial dimensions
-        mean_color = torch.mean(region, dim=(-2, -1), keepdim=True)
+        # Convert to 0-255 range to match JavaScript pixel values
+        region_255 = region * 255.0
 
-        # Mean absolute deviation (matches reference implementation)
-        deviations = torch.abs(region - mean_color)
-        variance = torch.mean(deviations).item()
+        # Separate RGB channels
+        if region.dim() == 4:
+            r = region_255[:, 0, :, :]
+            g = region_255[:, 1, :, :]
+            b = region_255[:, 2, :, :]
+        else:
+            r = region_255[0, :, :]
+            g = region_255[1, :, :]
+            b = region_255[2, :, :]
 
-        return variance
+        # Calculate mean and mean of squares for each channel
+        r_mean = torch.mean(r)
+        g_mean = torch.mean(g)
+        b_mean = torch.mean(b)
+
+        r_mean_sq = torch.mean(r * r)
+        g_mean_sq = torch.mean(g * g)
+        b_mean_sq = torch.mean(b * b)
+
+        # Variance formula: Var(X) = E[X²] - E[X]²
+        var_r = r_mean_sq - r_mean * r_mean
+        var_g = g_mean_sq - g_mean * g_mean
+        var_b = b_mean_sq - b_mean * b_mean
+
+        # Combined color variation (Euclidean distance in RGB space)
+        # EXACTLY matches JavaScript: Math.sqrt(varR + varG + varB)
+        variation = torch.sqrt(var_r + var_g + var_b).item()
+
+        return variation
 
     def should_subdivide(self, node: QuadtreeNode, variance: float) -> bool:
-        """Determine if a node should be subdivided"""
-        # Don't subdivide if at max depth
-        if node.depth >= self.max_depth:
+        """
+        Determine if a node should be subdivided
+        EXACTLY matches JavaScript logic:
+          shouldSubdivide = (variation > threshold && w > minSize && h > minSize) ||
+                           (w > maxSize || h > maxSize)
+        """
+        # Check if children would be too small (after 8-alignment)
+        half_w = ((node.w // 2) // 8) * 8
+        half_h = ((node.h // 2) // 8) * 8
+
+        # Can't subdivide if children would be smaller than minSize
+        if half_w < self.min_tile_size or half_h < self.min_tile_size:
             return False
 
-        # Don't subdivide if tile would be too small
-        half_w_aligned = ((node.w // 2) // 8) * 8
-        half_h_aligned = ((node.h // 2) // 8) * 8
-
-        if half_w_aligned < max(self.min_tile_size, 8) or half_h_aligned < max(self.min_tile_size, 8):
+        # Ensure 8-pixel alignment for remainders too
+        remainder_w = node.w - half_w
+        remainder_h = node.h - half_h
+        if remainder_w % 8 != 0 or remainder_h % 8 != 0:
             return False
 
-        # NEW: Check 8-pixel alignment for BOTH halves and remainders
-        # This prevents creating children that violate VAE's 8-pixel alignment requirement
-        remainder_w = node.w - half_w_aligned
-        remainder_h = node.h - half_h_aligned
+        # JavaScript logic: subdivide if EITHER:
+        # 1. Color variation exceeds threshold AND region larger than minSize
+        # 2. Region larger than maxSize (force subdivision for balanced tree)
+        should_subdivide = (variance > self.content_threshold and
+                           node.w > self.min_tile_size and
+                           node.h > self.min_tile_size) or \
+                          (node.w > self.max_tile_size or
+                           node.h > self.max_tile_size)
 
-        # All children must be >=8 and multiples of 8
-        if (half_w_aligned < 8 or half_h_aligned < 8 or
-            remainder_w < 8 or remainder_h < 8 or
-            remainder_w % 8 != 0 or remainder_h % 8 != 0):
-            return False
-
-        # Subdivide if variance is above threshold
-        return variance > self.content_threshold
+        return should_subdivide
 
     def build_tree(self, tensor: torch.Tensor, root_node: QuadtreeNode = None) -> QuadtreeNode:
         """
@@ -1210,25 +1237,25 @@ class QuadtreeVisualizer:
             "required": {
                 "image": ("IMAGE",),
                 "content_threshold": ("FLOAT", {
-                    "default": 0.03,
-                    "min": 0.001,
-                    "max": 0.5,
-                    "step": 0.001,
-                    "tooltip": "Variance threshold for subdivision. Lower = more tiles in detailed areas."
+                    "default": 25.0,
+                    "min": 1.0,
+                    "max": 200.0,
+                    "step": 1.0,
+                    "tooltip": "Variance threshold for subdivision (1-200, higher = fewer tiles). Matches JavaScript threshold."
                 }),
-                "max_depth": ("INT", {
-                    "default": 4,
-                    "min": 1,
-                    "max": 8,
-                    "step": 1,
-                    "tooltip": "Maximum quadtree depth"
+                "max_tile_size": ("INT", {
+                    "default": 500,
+                    "min": 10,
+                    "max": 1000,
+                    "step": 10,
+                    "tooltip": "Maximum tile size - forces subdivision for balanced tree (like JavaScript maxSize)"
                 }),
                 "min_tile_size": ("INT", {
-                    "default": 256,
-                    "min": 64,
-                    "max": 1024,
-                    "step": 8,
-                    "tooltip": "Minimum tile size in pixels. With rectangular quadtree, tiles naturally stay within image bounds."
+                    "default": 4,
+                    "min": 1,
+                    "max": 50,
+                    "step": 1,
+                    "tooltip": "Minimum tile size in pixels (1-50). Matches JavaScript minSize. Note: must be 8-aligned for VAE."
                 }),
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
@@ -1258,16 +1285,16 @@ class QuadtreeVisualizer:
     FUNCTION = "visualize"
     CATEGORY = "_for_testing/quadtree"
 
-    def visualize(self, image, content_threshold, max_depth, min_tile_size,
+    def visualize(self, image, content_threshold, max_tile_size, min_tile_size,
                   min_denoise, max_denoise, line_thickness):
         """
-        Visualize the quadtree structure overlaid on the input image
+        Visualize the quadtree structure (MATCHES JavaScript implementation exactly)
 
         Args:
             image: Input image tensor (B, H, W, C)
-            content_threshold: Variance threshold for subdivision
-            max_depth: Maximum tree depth
-            min_tile_size: Minimum tile size
+            content_threshold: Variance threshold (1-200, like JavaScript threshold)
+            max_tile_size: Maximum tile size forcing subdivision (like JavaScript maxSize)
+            min_tile_size: Minimum tile size (like JavaScript minSize)
             min_denoise: Min denoise value for large tiles
             max_denoise: Max denoise value for small tiles
             line_thickness: Thickness of boundary lines
@@ -1289,10 +1316,10 @@ class QuadtreeVisualizer:
             # Convert to tensor format for quadtree builder (C, H, W)
             img_tensor = img.permute(2, 0, 1)
 
-            # Build quadtree
+            # Build quadtree (MATCHES JavaScript parameters exactly)
             builder = QuadtreeBuilder(
                 content_threshold=content_threshold,
-                max_depth=max_depth,
+                max_tile_size=max_tile_size,
                 min_tile_size=min_tile_size,
                 min_denoise=min_denoise,
                 max_denoise=max_denoise
@@ -1335,12 +1362,12 @@ class QuadtreeVisualizer:
         # Stack batch
         output = torch.stack(results, dim=0)
 
-        # Print statistics
-        print(f'[Quadtree Visualizer]: Built quadtree with {len(leaves)} tiles (after filtering)')
+        # Print statistics (matching JavaScript-style output)
+        print(f'[Quadtree Visualizer]: Built quadtree with {len(leaves)} tiles')
         print(f'[Quadtree Visualizer]: Tile dimensions range from {min(l.w for l in leaves)}x{min(l.h for l in leaves)} to {max(l.w for l in leaves)}x{max(l.h for l in leaves)}')
         print(f'[Quadtree Visualizer]: Variance values range from {min(l.variance for l in leaves):.4f} to {max(l.variance for l in leaves):.4f}')
         print(f'[Quadtree Visualizer]: Denoise values range from {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
-        print(f'[Quadtree Visualizer]: Max depth reached: {max(l.depth for l in leaves)}')
+        print(f'[Quadtree Visualizer]: Max depth reached: {max(l.depth for l in leaves)} (no max_depth limit, uses max_tile_size={max_tile_size})')
 
         # Count tiles by depth to understand tree structure
         from collections import Counter
