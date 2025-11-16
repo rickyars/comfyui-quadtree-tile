@@ -1347,6 +1347,18 @@ class QuadtreeVisualizer:
                 new_w = (new_w // 8) * 8
                 new_h = (new_h // 8) * 8
 
+                # CRITICAL: Cap maximum tile dimensions to prevent memory issues
+                # Large tiles cause memory thrashing when moving between VRAM and RAM
+                MAX_TILE_DIM = 1024  # 128 latent pixels
+                if new_w > MAX_TILE_DIM:
+                    excess = new_w - MAX_TILE_DIM
+                    new_x += excess // 2  # Center the crop
+                    new_w = MAX_TILE_DIM
+                if new_h > MAX_TILE_DIM:
+                    excess = new_h - MAX_TILE_DIM
+                    new_y += excess // 2  # Center the crop
+                    new_h = MAX_TILE_DIM
+
                 # After rounding, if still too small, skip only if truly degenerate (< 64px)
                 if new_w < 64 or new_h < 64:
                     filtered_count += 1

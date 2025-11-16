@@ -436,6 +436,18 @@ class AbstractDiffusion:
                         new_core_y -= can_extend
                         new_core_h += can_extend
 
+                # CRITICAL: Cap maximum core dimensions to prevent memory issues
+                # Large tiles cause memory thrashing when moving between VRAM and RAM
+                MAX_CORE_DIM_LATENT = 128  # 1024 pixels
+                if new_core_w > MAX_CORE_DIM_LATENT:
+                    excess = new_core_w - MAX_CORE_DIM_LATENT
+                    new_core_x += excess // 2  # Center the crop
+                    new_core_w = MAX_CORE_DIM_LATENT
+                if new_core_h > MAX_CORE_DIM_LATENT:
+                    excess = new_core_h - MAX_CORE_DIM_LATENT
+                    new_core_y += excess // 2  # Center the crop
+                    new_core_h = MAX_CORE_DIM_LATENT
+
                 # Only filter truly degenerate tiles (< 8 latent pixels = 64px)
                 if new_core_w < 8 or new_core_h < 8:
                     filtered_count += 1
@@ -499,17 +511,17 @@ class AbstractDiffusion:
                 w = core_w + 2 * max_safe_overlap
                 h = core_h + 2 * max_safe_overlap
 
-                # Cap individual dimensions to prevent freezing (max 256 latent = 2048 pixels)
-                # Very large tiles can cause OOM or freezing
-                MAX_TILE_DIM_LATENT = 256
-                if w > MAX_TILE_DIM_LATENT:
-                    excess = w - MAX_TILE_DIM_LATENT
+                # Cap individual dimensions INCLUDING overlap to prevent memory issues
+                # Large tiles cause memory thrashing between VRAM and RAM
+                MAX_TILE_WITH_OVERLAP_LATENT = 160  # 1280 pixels with overlap
+                if w > MAX_TILE_WITH_OVERLAP_LATENT:
+                    excess = w - MAX_TILE_WITH_OVERLAP_LATENT
                     x += excess // 2  # Trim equally from both sides
-                    w = MAX_TILE_DIM_LATENT
-                if h > MAX_TILE_DIM_LATENT:
-                    excess = h - MAX_TILE_DIM_LATENT
+                    w = MAX_TILE_WITH_OVERLAP_LATENT
+                if h > MAX_TILE_WITH_OVERLAP_LATENT:
+                    excess = h - MAX_TILE_WITH_OVERLAP_LATENT
                     y += excess // 2  # Trim equally from both sides
-                    h = MAX_TILE_DIM_LATENT
+                    h = MAX_TILE_WITH_OVERLAP_LATENT
 
                 bbox = BBox(x, y, w, h)
                 bbox.denoise = leaf.denoise
