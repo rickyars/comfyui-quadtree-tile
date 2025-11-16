@@ -1224,10 +1224,10 @@ class QuadtreeVisualizer:
                 }),
                 "min_tile_size": ("INT", {
                     "default": 256,
-                    "min": 64,
+                    "min": 128,
                     "max": 1024,
                     "step": 8,
-                    "tooltip": "Minimum tile size in pixels"
+                    "tooltip": "Minimum tile size in pixels. Must be at least 128 to ensure edge tiles remain large enough for effective diffusion after cropping."
                 }),
                 "min_denoise": ("FLOAT", {
                     "default": 0.2,
@@ -1318,6 +1318,22 @@ class QuadtreeVisualizer:
                 new_y = max(0, leaf.y)
                 new_w = min(w, leaf.x + leaf.w) - new_x
                 new_h = min(h, leaf.y + leaf.h) - new_y
+
+                # Round dimensions UP to nearest multiple of 8 for proper latent space alignment
+                # This prevents coverage gaps when converting between image and latent space
+                new_w = ((new_w + 7) // 8) * 8
+                new_h = ((new_h + 7) // 8) * 8
+
+                # Clamp to image bounds to avoid extending beyond
+                new_w = min(new_w, w - new_x)
+                new_h = min(new_h, h - new_y)
+
+                # Minimum dimension check - edge tiles must be at least 128 pixels
+                # Smaller tiles are too small for effective diffusion and create instability
+                MIN_EDGE_TILE_DIM = 128
+                if new_w < MIN_EDGE_TILE_DIM or new_h < MIN_EDGE_TILE_DIM:
+                    filtered_count += 1
+                    continue
 
                 # Check if this was actually cropped
                 if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
