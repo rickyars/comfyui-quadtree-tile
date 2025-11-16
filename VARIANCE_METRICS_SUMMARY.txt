@@ -1,0 +1,276 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                   QUADTREE VARIANCE METRICS EVALUATION                       ║
+║                           Executive Summary                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ USER'S CONCERN: "Cuts seem pretty random. Goal was to find areas with a lot │
+│                 of detail and areas without detail."                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 1. METRIC COMPARISON VERDICT                                                ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   Reference (urchinemerald)          Current (ComfyUI)
+   ─────────────────────────          ─────────────────
+   Euclidean RGB Distance             Mean Absolute Deviation (MAD)
+   avg(√(ΔR² + ΔG² + ΔB²))           avg(|ΔR| + |ΔG| + |ΔB|) / 3
+
+   FINDING: These metrics are HIGHLY CORRELATED (Euclidean ≈ 1.7 × MAD)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ✗ Switching metrics would NOT solve the "random cuts" problem
+   ✓ Both metrics rank patterns in nearly identical order
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 2. ROOT CAUSE: THE FUNDAMENTAL LIMITATION                                   ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   ╔════════════════════════════════════════════════════════════════════╗
+   ║  BOTH METRICS MEASURE COLOR VARIATION, NOT SPATIAL DETAIL          ║
+   ╚════════════════════════════════════════════════════════════════════╝
+
+   Problem: Smooth gradients score similarly to sharp edges
+
+   Example:
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ Smooth Sky Gradient (0 → 1 over 100px)                             │
+   │ ░░░░░░▒▒▒▒▒▒▓▓▓▓▓▓████████                                         │
+   │ MAD: 0.2500  |  Should subdivide? NO (low detail)                  │
+   │                                                                     │
+   │ Sharp Edge (0|1 at midpoint)                                        │
+   │ ░░░░░░░░░░░░░│████████████                                         │
+   │ MAD: 0.5000  |  Should subdivide? YES (high detail)                │
+   └─────────────────────────────────────────────────────────────────────┘
+
+   At tile level, a gentle gradient can score similar to a sharp edge!
+   This creates "random" appearance.
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 3. THRESHOLD ANALYSIS                                                       ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   Reference Implementation:
+   ├─ Range: 5-50 (on 0-255 scale) = 0.0196-0.196 (normalized)
+   ├─ Control: Dynamic (user mouse position)
+   └─ Min tile: 6×6 pixels
+
+   Current Implementation:
+   ├─ Value: 0.05 (normalized) = ~12.75 (on 0-255 scale)
+   ├─ Control: Pre-configured (but adjustable in UI)
+   └─ Min tile: 256 pixels (VAE requirement)
+
+   Position: 0.05 is at 17% of reference range
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ⚠ Current threshold is CONSERVATIVE (biased toward fewer tiles)
+
+   Test Results:
+   ┌────────────────────────────────────────────────────────┐
+   │ Pattern                    MAD      Subdivide @ 0.05?  │
+   ├────────────────────────────────────────────────────────┤
+   │ Uniform gray               0.0000   ✗ NO               │
+   │ Sky gradient               0.0083   ✗ NO               │
+   │ Low-amplitude noise        0.0752   ✓ YES              │
+   │ Random noise               0.2498   ✓ YES              │
+   │ Smooth gradient            0.2500   ✓ YES   ← Problem! │
+   │ Checkerboard (4px)         0.5000   ✓ YES              │
+   │ Sharp edge                 0.5000   ✓ YES              │
+   └────────────────────────────────────────────────────────┘
+
+   Observation: Smooth gradients trigger subdivision like sharp edges!
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 4. WHY SUBDIVISIONS APPEAR "RANDOM"                                         ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   Contributing Factors:
+
+   ① Color-based metric doesn't capture spatial detail
+      ├─ Sky with gradient: MAY subdivide (high color variance)
+      └─ Concrete texture: MAY NOT subdivide (low color variance)
+
+   ② Metric can't distinguish gradients from edges
+      ├─ Smooth color transition: scores high
+      └─ Sharp detail boundary: also scores high
+
+   ③ Large minimum tile size (256px)
+      ├─ Averages out local features
+      └─ Reference uses 6×6 (40× smaller)
+
+   ④ Conservative threshold (0.05)
+      ├─ Misses subtle but perceptually important detail
+      └─ Textured areas with low amplitude don't trigger
+
+   Result: Subdivisions respond to color statistics, not visual complexity
+           → Creates perception of "randomness"
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 5. SOLUTION RECOMMENDATIONS                                                 ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   ╔═══════════════════════════════════════════════════════════════════════╗
+   ║  Option A: Adjust Threshold (QUICK WIN)                              ║
+   ╚═══════════════════════════════════════════════════════════════════════╝
+
+   Change:  content_threshold: 0.05 → 0.03
+   Impact:  More aggressive subdivision, better detail capture
+   Risk:    Low (users can adjust if too aggressive)
+   Time:    5 minutes
+
+   File: /home/user/comfyui-quadtree-tile/tiled_vae.py:1268
+
+   Pros: ✓ Immediate improvement
+         ✓ No breaking changes
+         ✓ Already configurable in UI
+
+   Cons: ✗ Doesn't solve fundamental limitation
+         ✗ Still can't distinguish gradients from edges
+
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   ╔═══════════════════════════════════════════════════════════════════════╗
+   ║  Option B: Switch to Euclidean (NOT RECOMMENDED)                     ║
+   ╚═══════════════════════════════════════════════════════════════════════╝
+
+   Change:  MAD → Euclidean RGB Distance
+   Impact:  Minimal (metrics are 1.7× apart, same ranking)
+   Risk:    Breaking change for existing configs
+
+   Verdict: ✗ NOT RECOMMENDED
+            ✗ No practical improvement
+            ✗ Same fundamental limitations
+
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   ╔═══════════════════════════════════════════════════════════════════════╗
+   ║  Option C: Add Gradient-Based Metric (BEST SOLUTION)                 ║
+   ╚═══════════════════════════════════════════════════════════════════════╝
+
+   Approach: Combine color variance with edge detection
+
+   Formula:  variance = α × MAD + β × gradient_magnitude
+
+   Where:
+   - MAD captures color variation (existing)
+   - gradient_magnitude captures spatial detail (new)
+   - α, β are tunable weights (e.g., 0.5, 0.5)
+
+   Gradient calculation:
+   ├─ Use Sobel/Scharr operators
+   ├─ Detect edges and texture
+   └─ Distinguish smooth from sharp transitions
+
+   Why this works:
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ Pattern            │ Color Variance │ Gradient │ Combined       │
+   ├────────────────────┼────────────────┼──────────┼────────────────┤
+   │ Smooth gradient    │ HIGH           │ LOW      │ MEDIUM → Less  │
+   │ Sharp edge         │ MEDIUM         │ HIGH     │ HIGH   → More  │
+   │ Texture            │ LOW            │ HIGH     │ MEDIUM → More  │
+   │ Uniform color      │ ZERO           │ ZERO     │ ZERO   → None  │
+   └─────────────────────────────────────────────────────────────────┘
+
+   Pros: ✓ Solves gradient vs edge problem
+         ✓ Captures spatial detail and texture
+         ✓ Better aligns with perceptual "detail"
+         ✓ Tunable via α, β weights
+
+   Cons: ✗ More computational cost (3-5× slower)
+         ✗ Requires threshold retuning
+         ✗ Added complexity
+
+   Mitigation:
+   - Lazy evaluation (only if color variance near threshold)
+   - Downsampling for gradient calculation
+   - Optimized GPU kernels
+
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   ╔═══════════════════════════════════════════════════════════════════════╗
+   ║  Option D: Multi-Metric Selection (LONG-TERM)                        ║
+   ╚═══════════════════════════════════════════════════════════════════════╝
+
+   Approach: Let users choose metric type
+
+   Options:
+   ├─ "color"    : Color variance only (current)
+   ├─ "edge"     : Gradient-based spatial detail
+   └─ "combined" : Both (Option C)
+
+   Use cases:
+   - Sky/uniform backgrounds    → "color"
+   - Photographs/detailed areas → "edge" or "combined"
+   - General purpose            → "combined"
+
+   Pros: ✓ Maximum flexibility
+         ✓ Handles diverse content types
+
+   Cons: ✗ Choice paralysis for users
+         ✗ More maintenance
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 6. IMPLEMENTATION ROADMAP                                                   ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   Phase 1: IMMEDIATE (Week 1)
+   ┌────────────────────────────────────────────────────────────┐
+   │ • Lower default threshold: 0.05 → 0.03                     │
+   │ • Update tooltip documentation                             │
+   │ • Test on sample images                                    │
+   └────────────────────────────────────────────────────────────┘
+   Impact: Moderate improvement with minimal effort
+
+   Phase 2: SHORT-TERM (Month 1)
+   ┌────────────────────────────────────────────────────────────┐
+   │ • Implement gradient-based component (Option C)            │
+   │ • Add α, β weight configuration                            │
+   │ • Performance optimization                                 │
+   │ • Extensive testing on diverse images                      │
+   └────────────────────────────────────────────────────────────┘
+   Impact: Major improvement in detail detection
+
+   Phase 3: LONG-TERM (Quarter 1)
+   ┌────────────────────────────────────────────────────────────┐
+   │ • Add metric selection UI (Option D)                       │
+   │ • Documentation with visual examples                       │
+   │ • User guidelines for metric selection                     │
+   └────────────────────────────────────────────────────────────┘
+   Impact: Maximum flexibility
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 7. FINAL VERDICT                                                            ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   Question: Is MAD or Euclidean better for detail detection?
+   Answer:   ✗ NEITHER - Both have the same fundamental limitation
+
+   Real Issue: Color-based metrics can't distinguish:
+               • Smooth gradients from sharp edges
+               • Color variation from spatial detail
+               • Low-amplitude texture from uniform areas
+
+   Best Solution: Add gradient-based component (Option C)
+                  Combines color statistics with spatial analysis
+
+   Quick Win: Lower threshold to 0.03 (Option A)
+              Provides immediate improvement while Option C is implemented
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ REFERENCES                                                                   ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+   Detailed Report:
+   /home/user/comfyui-quadtree-tile/ARCHITECTURAL_EVALUATION_VARIANCE_METRICS.md
+
+   Analysis Script:
+   /home/user/comfyui-quadtree-tile/analyze_variance_metrics.py
+
+   Current Implementation:
+   /home/user/comfyui-quadtree-tile/tiled_vae.py (lines 161-218)
+
+   Reference:
+   https://github.com/urchinemerald/quadtree_subdivision
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              END OF SUMMARY                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
