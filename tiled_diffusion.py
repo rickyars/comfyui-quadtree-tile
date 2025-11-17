@@ -1132,18 +1132,32 @@ class MixtureOfDiffusers(AbstractDiffusion):
         scaled_bboxes_cache = {}
         if use_qt:
             for k, v in c_in.items():
-                if isinstance(v, torch.Tensor) and v.shape[-2:] != x_in.shape[-2:]:
-                    # Conditioning tensor has different resolution - precompute scaled bboxes
-                    cf = x_in.shape[-1] * self.compression // v.shape[-1]  # compression factor
-                    if cf not in scaled_bboxes_cache:
-                        scaled_bboxes = []
-                        for batch in self.batched_bboxes:
-                            scaled_batch = []
-                            for bbox in batch:
-                                scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
-                                scaled_batch.append(scaled_bbox)
-                            scaled_bboxes.append(scaled_batch)
-                        scaled_bboxes_cache[cf] = scaled_bboxes
+                # Only process 4D spatial tensors (matches original logic at line 1239)
+                if not isinstance(v, torch.Tensor):
+                    continue
+                if len(v.shape) != len(x_in.shape):
+                    continue  # Skip non-spatial tensors (timesteps, pooled features, etc.)
+                if v.shape[-2:] == x_in.shape[-2:]:
+                    continue  # Same resolution, no scaling needed
+
+                # Conditioning tensor has different resolution - precompute scaled bboxes
+                cf = x_in.shape[-1] * self.compression // v.shape[-1]  # compression factor
+
+                # Guard against invalid compression factor (would cause ZeroDivisionError)
+                if cf <= 0:
+                    print(f'[Quadtree Warning]: Skipping conditioning tensor "{k}" - invalid compression factor cf={cf}')
+                    print(f'  x_in.shape={x_in.shape}, v.shape={v.shape}, compression={self.compression}')
+                    continue
+
+                if cf not in scaled_bboxes_cache:
+                    scaled_bboxes = []
+                    for batch in self.batched_bboxes:
+                        scaled_batch = []
+                        for bbox in batch:
+                            scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
+                            scaled_batch.append(scaled_bbox)
+                        scaled_bboxes.append(scaled_batch)
+                    scaled_bboxes_cache[cf] = scaled_bboxes
 
         # Global sampling
         if self.draw_background:
