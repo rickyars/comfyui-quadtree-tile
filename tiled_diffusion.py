@@ -1203,9 +1203,10 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 # SKIP TILES: Handle tiles that will not go through model inference
                 if len(skip_bboxes) > 0:
                     if hasattr(self, 'original_latent') and self.original_latent is not None:
-                        # img2img: Compute noise prediction that restores original content
-                        # Formula: predicted_noise = x_in - original
-                        # Sampler does: x_next = x_in - predicted_noise = x_in - (x_in - original) = original ✓
+                        # img2img: Compute model prediction that moves toward original content
+                        # FLUX uses velocity prediction (Rectified Flow): velocity points toward target
+                        # Formula: predicted_velocity = original - x_in (direction toward target)
+                        # Sampler does: x_next = x_in + predicted_velocity * dt → converges to original ✓
                         for bbox in skip_bboxes:
                             # Extract tiles from both current noisy state and original clean latent
                             x_in_tile = extract_tile_with_padding(x_in, bbox, self.w, self.h)
@@ -1217,8 +1218,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             if original_tile.shape[-2] > bbox.h or original_tile.shape[-1] > bbox.w:
                                 original_tile = original_tile[:, :, :bbox.h, :bbox.w]
 
-                            # Compute noise prediction that will restore original
-                            noise_prediction = x_in_tile - original_tile
+                            # Compute velocity/noise prediction that will restore original
+                            # FLUX (velocity): velocity = original - x_in (points toward target)
+                            # SD1.5/SDXL (noise): noise = x_in - original (what to subtract)
+                            # FLUX is velocity-based (additive), so use: original - x_in
+                            model_prediction = original_tile - x_in_tile
 
                             # Calculate intersection with image boundaries
                             x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
@@ -1232,7 +1236,7 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             tile_y_offset = y_start - y
 
                             # Extract valid portion (remove padding)
-                            valid_noise = noise_prediction[:, :,
+                            valid_prediction = model_prediction[:, :,
                                                           tile_y_offset:tile_y_offset + (y_end - y_start),
                                                           tile_x_offset:tile_x_offset + (x_end - x_start)]
 
@@ -1242,10 +1246,10 @@ class MixtureOfDiffusers(AbstractDiffusion):
                                 tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
                                                                 tile_x_offset:tile_x_offset + (x_end - x_start)]
                                 tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
-                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_noise * tile_weights
+                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_prediction * tile_weights
                             else:
-                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] = valid_noise
-                    # else: txt2img - zero noise prediction (do nothing, stays at zero in x_buffer)
+                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] = valid_prediction
+                    # else: txt2img - zero velocity/noise prediction (do nothing, stays at zero in x_buffer)
                     # This preserves current noisy state, which for txt2img will appear gray
                     # Recommendation: Use variable_denoise instead for txt2img workflows
 
