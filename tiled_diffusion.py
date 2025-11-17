@@ -1095,6 +1095,10 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # clear buffer canvas
         self.reset_buffer(x_in)
 
+        # Clear Gaussian weight cache to prevent unbounded memory growth
+        # Cache accumulates across denoising steps and can reach several MB with many tile sizes
+        self.gaussian_weight_cache.clear()
+
         # self.pbar = tqdm(total=(self.total_bboxes) * sampling_steps, desc=f"{self.method} Sampling: ")
         # self.pbar = tqdm(total=len(self.batched_bboxes), desc=f"{self.method} Sampling: ")
 
@@ -1122,6 +1126,24 @@ class MixtureOfDiffusers(AbstractDiffusion):
             print(f'[Quadtree Skip]: Processing {total_process} tiles through model, copying {total_skip} tiles directly')
             if skip_tile_sizes:
                 print(f'[Quadtree Skip]: Sample skip sizes: {", ".join(skip_tile_sizes[:5])}{"..." if len(skip_tile_sizes) > 5 else ""}')
+
+        # OPTIMIZATION: Precompute scaled_bboxes for conditioning tensors if needed
+        # This prevents wasteful recreation inside the batch loop (Issue #2)
+        scaled_bboxes_cache = {}
+        if use_qt:
+            for k, v in c_in.items():
+                if isinstance(v, torch.Tensor) and v.shape[-2:] != x_in.shape[-2:]:
+                    # Conditioning tensor has different resolution - precompute scaled bboxes
+                    cf = x_in.shape[-1] * self.compression // v.shape[-1]  # compression factor
+                    if cf not in scaled_bboxes_cache:
+                        scaled_bboxes = []
+                        for batch in self.batched_bboxes:
+                            scaled_batch = []
+                            for bbox in batch:
+                                scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
+                                scaled_batch.append(scaled_bbox)
+                            scaled_bboxes.append(scaled_batch)
+                        scaled_bboxes_cache[cf] = scaled_bboxes
 
         # Global sampling
         if self.draw_background:
@@ -1217,17 +1239,14 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         if len(v.shape) == len(x_tile.shape):
                             bboxes_ = bboxes
                             if v.shape[-2:] != x_in.shape[-2:]:
-                                # Conditioning tensor has different resolution - need to scale bboxes
-                                cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
-                                # Scale the quadtree bboxes to match conditioning resolution
-                                scaled_bboxes = []
-                                for batch in self.batched_bboxes:
-                                    scaled_batch = []
-                                    for bbox in batch:
-                                        scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
-                                        scaled_batch.append(scaled_bbox)
-                                    scaled_bboxes.append(scaled_batch)
-                                bboxes_ = scaled_bboxes[batch_id]
+                                # Conditioning tensor has different resolution - use precomputed scaled bboxes
+                                cf = x_in.shape[-1] * self.compression // v.shape[-1]  # compression factor
+                                # Use cached scaled_bboxes instead of recreating (much faster!)
+                                if cf in scaled_bboxes_cache:
+                                    bboxes_ = scaled_bboxes_cache[cf][batch_id]
+                                else:
+                                    # Fallback: shouldn't happen if precompute worked correctly
+                                    bboxes_ = [BBox(b.x // cf, b.y // cf, b.w // cf, b.h // cf) for b in bboxes]
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
@@ -1344,7 +1363,8 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         # when you have many tiles. So we calculate it here.
                         w = self.tile_weights * self.rescale_factor[bbox.slicer]
                         self.x_buffer[bbox.slicer] += tile_out * w
-                del x_tile_out, x_tile, t_tile, c_tile
+                # Explicitly delete temporary tensors and lists to free VRAM between batches
+                del x_tile_out, x_tile, t_tile, c_tile, x_tile_list
 
                 # self.update_pbar()
                 # self.pbar.update()
