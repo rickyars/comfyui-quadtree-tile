@@ -28,8 +28,15 @@ def KSAMPLER_sample(*args, **kwargs):
         store.sigmas = sigmas
         store.model_options = model_options
         store.extra_args = extra_args
+
+        # Capture latent_image for img2img workflows (preserves original content for skipped tiles)
+        latent_image = kwargs.get('latent_image') if 'latent_image' in kwargs else (args[6] if len(args) > 6 else None)
+        if latent_image is not None:
+            store.latent_image = latent_image
+        else:
+            _delattr(store, 'latent_image')  # txt2img has no latent_image
     else:
-        for attr in  ['sigmas', 'model_options', 'extra_args']:
+        for attr in  ['sigmas', 'model_options', 'extra_args', 'latent_image']:
             _delattr(store, attr)
     return orig_fn(*args, **kwargs)
 

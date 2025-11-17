@@ -289,6 +289,7 @@ class AbstractDiffusion:
         tile_batch_size = self.tile_batch_size
         compression = self.compression
         tile_overlap = getattr(self, 'tile_overlap', 8)
+        skip_diffusion_below = getattr(self, 'skip_diffusion_below', 0)
 
         # Preserve quadtree structure
         use_quadtree = getattr(self, 'use_quadtree', False)
@@ -298,6 +299,7 @@ class AbstractDiffusion:
         self.compression = compression
         self.tile_batch_size = tile_batch_size
         self.tile_overlap = tile_overlap
+        self.skip_diffusion_below = skip_diffusion_below
 
         # Restore quadtree structure
         self.use_quadtree = use_quadtree
@@ -384,77 +386,11 @@ class AbstractDiffusion:
                     print(f'[Quadtree Diffusion]: ⚠️  Overlap ({overlap}px latent) >= smallest tile dimension ({min_tile_dim}px latent = {min_tile_dim*8}px image). Reduce overlap or increase min_tile_size in visualizer.')
 
             # Reuse the quadtree structure from Visualizer
-            # Note: Visualizer operates in image space (8x larger), so we need to scale coordinates
+            # With rectangular quadtree, tiles are naturally within image bounds
+            # No cropping, filtering, or capping needed!
             leaves = visualizer_quadtree['leaves']
 
-            # CROP EDGE TILES TO IMAGE BOUNDS using actual runtime dimensions
-            # The quadtree creates a square root that extends beyond rectangular images
-            # Instead of filtering, crop edge tiles to create rectangular tiles at boundaries
-            original_leaf_count = len(leaves)
-
-            cropped_leaves = []
-            filtered_count = 0
-            cropped_count = 0
-
-            for leaf in leaves:
-                # Calculate CORE bounds (without overlap) in latent space
-                core_start_x = leaf.x // 8
-                core_start_y = leaf.y // 8
-                core_end_x = (leaf.x + leaf.w) // 8
-                core_end_y = (leaf.y + leaf.h) // 8
-
-                # Check if core overlaps with latent image at all
-                if core_start_x >= self.w or core_end_x <= 0 or core_start_y >= self.h or core_end_y <= 0:
-                    # Completely outside - skip it
-                    filtered_count += 1
-                    continue
-
-                # Core overlaps - crop to latent image bounds
-                new_core_x = max(0, core_start_x)
-                new_core_y = max(0, core_start_y)
-                new_core_w = min(self.w, core_end_x) - new_core_x
-                new_core_h = min(self.h, core_end_y) - new_core_y
-
-                # Convert back to image space for storage
-                new_x = new_core_x * 8
-                new_y = new_core_y * 8
-                new_w = new_core_w * 8
-                new_h = new_core_h * 8
-
-                # Check if this was actually cropped
-                if new_x != leaf.x or new_y != leaf.y or new_w != leaf.w or new_h != leaf.h:
-                    cropped_count += 1
-                    # Create new cropped leaf
-                    from tiled_vae import QuadtreeNode
-                    cropped_leaf = QuadtreeNode(new_x, new_y, new_w, new_h, leaf.depth)
-                    cropped_leaf.variance = leaf.variance
-                    cropped_leaf.denoise = leaf.denoise
-                    cropped_leaves.append(cropped_leaf)
-                else:
-                    # Keep original
-                    cropped_leaves.append(leaf)
-
-            leaves = cropped_leaves
-
-            if filtered_count > 0 or cropped_count > 0:
-                print(f'[Quadtree Diffusion]: Filtered {filtered_count} fully out-of-bounds leaves, cropped {cropped_count} edge tiles (latent: {self.w}x{self.h})')
-
-                # Reassign denoise values after cropping
-                # The cropped tiles have different areas, so we need to recalculate
-                if len(leaves) > 0:
-                    min_denoise = visualizer_quadtree['min_denoise']
-                    max_denoise = visualizer_quadtree['max_denoise']
-
-                    # Find new max area among kept leaves only
-                    max_tile_area = max(leaf.w * leaf.h for leaf in leaves)
-
-                    # Reassign denoise values based on new areas
-                    for leaf in leaves:
-                        tile_area = leaf.w * leaf.h
-                        size_ratio = tile_area / max_tile_area
-                        leaf.denoise = min_denoise + (max_denoise - min_denoise) * (1.0 - size_ratio)
-
-                    print(f'[Quadtree Diffusion]: Reassigned denoise values: {min(l.denoise for l in leaves):.3f} to {max(l.denoise for l in leaves):.3f}')
+            print(f'[Quadtree Diffusion]: Processing {len(leaves)} tiles (latent: {self.w}x{self.h})')
 
             bbox_list = []
             for idx, leaf in enumerate(leaves):
@@ -462,21 +398,29 @@ class AbstractDiffusion:
                 core_x, core_y = leaf.x // 8, leaf.y // 8
                 core_w, core_h = leaf.w // 8, leaf.h // 8
 
+                # Cap overlap to 50% of tile dimension to prevent degenerate cases
+                max_safe_overlap = min(core_w // 2, core_h // 2, overlap)
+
                 # Add overlap symmetrically on all sides
-                # Most tiles stay square, but edge tiles may be rectangular after cropping
-                x = core_x - overlap
-                y = core_y - overlap
-                w = core_w + 2 * overlap
-                h = core_h + 2 * overlap
+                # Tiles are rectangular (naturally sized from quadtree)
+                x = core_x - max_safe_overlap
+                y = core_y - max_safe_overlap
+                w = core_w + 2 * max_safe_overlap
+                h = core_h + 2 * max_safe_overlap
 
                 bbox = BBox(x, y, w, h)
                 bbox.denoise = leaf.denoise
                 bbox.variance = leaf.variance
                 bbox.core_region = (core_x, core_y, core_w, core_h)  # Store the non-overlapping core
+                bbox.pixel_w = leaf.w  # Store original pixel dimensions for skip logic
+                bbox.pixel_h = leaf.h
                 bbox_list.append(bbox)
 
                 # For overlap mode, accumulate actual Gaussian weights
                 # IMPORTANT: Only accumulate weights for pixels INSIDE the image
+                # NOTE: Weights are accumulated for ALL tiles (including skipped ones) because:
+                #  - img2img: skipped tiles contribute noise predictions (need normalization)
+                #  - txt2img: normalization handles zero contributions gracefully (0/weight=0)
                 if overlap > 0:
                     tile_weights = self.get_weight(w, h)
 
@@ -1127,6 +1071,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 print(f'[Quadtree Variable Denoise]: WARNING - Failed to load sigmas: {e}')
                 pass
 
+        # Store original latent for img2img skip feature (from store if available)
+        if not hasattr(self, 'original_latent'):
+            try:
+                from .utils import store
+                if hasattr(store, 'latent_image'):
+                    self.original_latent = store.latent_image
+                    print(f'[Quadtree Skip]: Loaded original latent for img2img, shape={self.original_latent.shape}')
+                else:
+                    self.original_latent = None  # txt2img has no original latent
+            except Exception as e:
+                print(f'[Quadtree Skip]: WARNING - Failed to load original latent: {e}')
+                self.original_latent = None
+
         self.refresh = False
         # self.refresh = True
         if self.weights is None or self.h != H or self.w != W:
@@ -1154,8 +1111,69 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # clear buffer canvas
         self.reset_buffer(x_in)
 
+        # Clear Gaussian weight cache to prevent unbounded memory growth
+        # Cache accumulates across denoising steps and can reach several MB with many tile sizes
+        self.gaussian_weight_cache.clear()
+
         # self.pbar = tqdm(total=(self.total_bboxes) * sampling_steps, desc=f"{self.method} Sampling: ")
         # self.pbar = tqdm(total=len(self.batched_bboxes), desc=f"{self.method} Sampling: ")
+
+        # PRE-CALCULATE SKIP STATISTICS: Count how many tiles will be skipped
+        skip_threshold = getattr(self, 'skip_diffusion_below', 0)
+        if use_qt and skip_threshold > 0:
+            total_tiles = 0
+            total_skip = 0
+            skip_tile_sizes = []
+
+            for bboxes in self.batched_bboxes:
+                for bbox in bboxes:
+                    total_tiles += 1
+                    pixel_w = getattr(bbox, 'pixel_w', 0)
+                    pixel_h = getattr(bbox, 'pixel_h', 0)
+                    min_dimension = min(pixel_w, pixel_h)
+
+                    if min_dimension < skip_threshold:
+                        total_skip += 1
+                        if len(skip_tile_sizes) < 10:  # Sample first 10 for debugging
+                            skip_tile_sizes.append(f"{pixel_w}x{pixel_h}")
+
+            total_process = total_tiles - total_skip
+            print(f'[Quadtree Skip]: Will skip {total_skip}/{total_tiles} tiles (min dimension < {skip_threshold}px)')
+            print(f'[Quadtree Skip]: Processing {total_process} tiles through model, copying {total_skip} tiles directly')
+            if skip_tile_sizes:
+                print(f'[Quadtree Skip]: Sample skip sizes: {", ".join(skip_tile_sizes[:5])}{"..." if len(skip_tile_sizes) > 5 else ""}')
+
+        # OPTIMIZATION: Precompute scaled_bboxes for conditioning tensors if needed
+        # This prevents wasteful recreation inside the batch loop (Issue #2)
+        scaled_bboxes_cache = {}
+        if use_qt:
+            for k, v in c_in.items():
+                # Only process 4D spatial tensors (matches original logic at line 1239)
+                if not isinstance(v, torch.Tensor):
+                    continue
+                if len(v.shape) != len(x_in.shape):
+                    continue  # Skip non-spatial tensors (timesteps, pooled features, etc.)
+                if v.shape[-2:] == x_in.shape[-2:]:
+                    continue  # Same resolution, no scaling needed
+
+                # Conditioning tensor has different resolution - precompute scaled bboxes
+                cf = x_in.shape[-1] * self.compression // v.shape[-1]  # compression factor
+
+                # Guard against invalid compression factor (would cause ZeroDivisionError)
+                if cf <= 0:
+                    print(f'[Quadtree Warning]: Skipping conditioning tensor "{k}" - invalid compression factor cf={cf}')
+                    print(f'  x_in.shape={x_in.shape}, v.shape={v.shape}, compression={self.compression}')
+                    continue
+
+                if cf not in scaled_bboxes_cache:
+                    scaled_bboxes = []
+                    for batch in self.batched_bboxes:
+                        scaled_batch = []
+                        for bbox in batch:
+                            scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
+                            scaled_batch.append(scaled_bbox)
+                        scaled_bboxes.append(scaled_batch)
+                    scaled_bboxes_cache[cf] = scaled_bboxes
 
         # Global sampling
         if self.draw_background:
@@ -1163,7 +1181,84 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 if processing_interrupted():
                     # self.pbar.close()
                     return x_in
-                # batching
+
+                # SKIP LOGIC: Separate tiles into skip and process lists
+                process_bboxes = []
+                skip_bboxes = []
+
+                if use_qt and skip_threshold > 0:
+                    for bbox in bboxes:
+                        pixel_w = getattr(bbox, 'pixel_w', 0)
+                        pixel_h = getattr(bbox, 'pixel_h', 0)
+                        min_dimension = min(pixel_w, pixel_h)
+
+                        if min_dimension < skip_threshold:
+                            skip_bboxes.append(bbox)
+                        else:
+                            process_bboxes.append(bbox)
+                else:
+                    # No skipping, process all tiles
+                    process_bboxes = bboxes
+
+                # SKIP TILES: Handle tiles that will not go through model inference
+                if len(skip_bboxes) > 0:
+                    if hasattr(self, 'original_latent') and self.original_latent is not None:
+                        # img2img: Compute model prediction that moves toward original content
+                        # FLUX uses velocity prediction (Rectified Flow): velocity points toward target
+                        # Formula: predicted_velocity = original - x_in (direction toward target)
+                        # Sampler does: x_next = x_in + predicted_velocity * dt → converges to original ✓
+                        for bbox in skip_bboxes:
+                            # Extract tiles from both current noisy state and original clean latent
+                            x_in_tile = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+                            original_tile = extract_tile_with_padding(self.original_latent, bbox, self.w, self.h)
+
+                            # Crop both to bbox size if padded
+                            if x_in_tile.shape[-2] > bbox.h or x_in_tile.shape[-1] > bbox.w:
+                                x_in_tile = x_in_tile[:, :, :bbox.h, :bbox.w]
+                            if original_tile.shape[-2] > bbox.h or original_tile.shape[-1] > bbox.w:
+                                original_tile = original_tile[:, :, :bbox.h, :bbox.w]
+
+                            # Compute velocity/noise prediction that will restore original
+                            # FLUX (velocity): velocity = original - x_in (points toward target)
+                            # SD1.5/SDXL (noise): noise = x_in - original (what to subtract)
+                            # FLUX is velocity-based (additive), so use: original - x_in
+                            model_prediction = original_tile - x_in_tile
+
+                            # Calculate intersection with image boundaries
+                            x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+                            x_start = max(0, x)
+                            y_start = max(0, y)
+                            x_end = min(self.w, x + w)
+                            y_end = min(self.h, y + h)
+
+                            # Calculate offset into tiles
+                            tile_x_offset = x_start - x
+                            tile_y_offset = y_start - y
+
+                            # Extract valid portion (remove padding)
+                            valid_prediction = model_prediction[:, :,
+                                                          tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                          tile_x_offset:tile_x_offset + (x_end - x_start)]
+
+                            # Add to buffer with Gaussian weighting if overlap enabled
+                            if self.tile_overlap > 0:
+                                tile_weights_full = self.get_weight(bbox.w, bbox.h)
+                                tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                                tile_x_offset:tile_x_offset + (x_end - x_start)]
+                                tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
+                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_prediction * tile_weights
+                            else:
+                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] = valid_prediction
+                    # else: txt2img - zero velocity/noise prediction (do nothing, stays at zero in x_buffer)
+                    # This preserves current noisy state, which for txt2img will appear gray
+                    # Recommendation: Use variable_denoise instead for txt2img workflows
+
+                # Skip model inference if no tiles to process
+                if len(process_bboxes) == 0:
+                    continue
+
+                # batching (only for tiles that need processing)
+                bboxes = process_bboxes  # Replace bboxes with filtered list
                 x_tile_list     = []
 
                 # For quadtree with overlap, extract tiles with padding if needed
@@ -1194,17 +1289,14 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         if len(v.shape) == len(x_tile.shape):
                             bboxes_ = bboxes
                             if v.shape[-2:] != x_in.shape[-2:]:
-                                # Conditioning tensor has different resolution - need to scale bboxes
-                                cf = x_in.shape[-1] * self.compression // v.shape[-1] # compression factor
-                                # Scale the quadtree bboxes to match conditioning resolution
-                                scaled_bboxes = []
-                                for batch in self.batched_bboxes:
-                                    scaled_batch = []
-                                    for bbox in batch:
-                                        scaled_bbox = BBox(bbox.x // cf, bbox.y // cf, bbox.w // cf, bbox.h // cf)
-                                        scaled_batch.append(scaled_bbox)
-                                    scaled_bboxes.append(scaled_batch)
-                                bboxes_ = scaled_bboxes[batch_id]
+                                # Conditioning tensor has different resolution - use precomputed scaled bboxes
+                                cf = x_in.shape[-1] * self.compression // v.shape[-1]  # compression factor
+                                # Use cached scaled_bboxes instead of recreating (much faster!)
+                                if cf in scaled_bboxes_cache:
+                                    bboxes_ = scaled_bboxes_cache[cf][batch_id]
+                                else:
+                                    # Fallback: shouldn't happen if precompute worked correctly
+                                    bboxes_ = [BBox(b.x // cf, b.y // cf, b.w // cf, b.h // cf) for b in bboxes]
                             v = torch.cat([v[bbox_.slicer] for bbox_ in bboxes_])
                         if v.shape[0] != x_tile.shape[0]:
                             v = repeat_to_batch_size(v, x_tile.shape[0])
@@ -1321,7 +1413,8 @@ class MixtureOfDiffusers(AbstractDiffusion):
                         # when you have many tiles. So we calculate it here.
                         w = self.tile_weights * self.rescale_factor[bbox.slicer]
                         self.x_buffer[bbox.slicer] += tile_out * w
-                del x_tile_out, x_tile, t_tile, c_tile
+                # Explicitly delete temporary tensors and lists to free VRAM between batches
+                del x_tile_out, x_tile, t_tile, c_tile, x_tile_list
 
                 # self.update_pbar()
                 # self.pbar.update()
@@ -1357,6 +1450,7 @@ class TiledDiffusion():
                                 "enable_overlap": ("BOOLEAN", {"default": False, "tooltip": "Enable tile overlap for smoother blending. Currently experimental."}),
                                 "tile_overlap": ("INT", {"default": 16*opt_f, "min": opt_f, "max": 256*opt_f, "step": opt_f, "tooltip": "Overlap between tiles in pixels (image space). Minimum 8px (1px latent). Gets divided by 8 for latent space."}),
                                 "tile_batch_size": ("INT", {"default": 4, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                                "skip_diffusion_below": ("INT", {"default": 0, "min": 0, "max": 512, "step": 8, "tooltip": "Skip diffusion for tiles smaller than this size in pixels (0 = disabled). Preserves original details for small tiles. Must be multiple of 8 for VAE compatibility."}),
                             }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
@@ -1373,9 +1467,10 @@ class TiledDiffusion():
     def __init__(self) -> None:
         self.__class__.instances.add(self)
 
-    def apply(self, model: ModelPatcher, method, quadtree, enable_overlap, tile_overlap, tile_batch_size):
+    def apply(self, model: ModelPatcher, method, quadtree, enable_overlap, tile_overlap, tile_batch_size, skip_diffusion_below):
 
-        print(f'[Quadtree Diffusion]: Overlap: {"enabled" if enable_overlap else "disabled"}{f" ({tile_overlap}px)" if enable_overlap else ""}')
+        skip_enabled = skip_diffusion_below > 0
+        print(f'[Quadtree Diffusion]: Overlap: {"enabled" if enable_overlap else "disabled"}{f" ({tile_overlap}px)" if enable_overlap else ""}, Skip: {"enabled" if skip_enabled else "disabled"}{f" (<{skip_diffusion_below}px)" if skip_enabled else ""}')
 
         if method == "Mixture of Diffusers":
             self.impl = MixtureOfDiffusers()
@@ -1393,12 +1488,13 @@ class TiledDiffusion():
         compression = 4 if "CASCADE" in str(model.model.model_type) else 8
         self.impl.compression = compression
 
-        # Store quadtree structure, overlap, and batch size
+        # Store quadtree structure, overlap, batch size, and skip threshold
         self.impl.use_quadtree = True
         self.impl.quadtree_from_visualizer = quadtree
         self.impl.enable_overlap = enable_overlap
         self.impl.tile_overlap = (tile_overlap // compression) if enable_overlap else 0  # Convert to latent space or disable
         self.impl.tile_batch_size = tile_batch_size
+        self.impl.skip_diffusion_below = skip_diffusion_below  # Store in pixel space, we'll check during diffusion
 
         # self.impl.init_grid_bbox(tile_width, tile_height, tile_overlap, tile_batch_size)
         # # init everything done, perform sanity check & pre-computations
