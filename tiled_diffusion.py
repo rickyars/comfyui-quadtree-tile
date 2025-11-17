@@ -416,9 +416,16 @@ class AbstractDiffusion:
                 bbox.pixel_h = leaf.h
                 bbox_list.append(bbox)
 
+                # CHECK: Will this tile be skipped during sampling?
+                # Only accumulate weights for tiles that will actually contribute noise predictions
+                skip_threshold = getattr(self, 'skip_diffusion_below', 0)
+                min_dimension = min(leaf.w, leaf.h)
+                will_be_skipped = skip_threshold > 0 and min_dimension < skip_threshold
+
                 # For overlap mode, accumulate actual Gaussian weights
                 # IMPORTANT: Only accumulate weights for pixels INSIDE the image
-                if overlap > 0:
+                # CRITICAL: Skip weight accumulation for tiles that will be skipped during processing
+                if not will_be_skipped and overlap > 0:
                     tile_weights = self.get_weight(w, h)
 
                     # Calculate the intersection of the tile with the image
@@ -437,9 +444,10 @@ class AbstractDiffusion:
                     if x_end > x_start and y_end > y_start:
                         self.weights[:, :, y_start:y_end, x_start:x_end] += \
                             tile_weights[tile_y_offset:tile_y_end_offset, tile_x_offset:tile_x_end_offset]
-                else:
+                elif not will_be_skipped:
                     # For non-overlap mode, just count coverage
                     # Only count pixels inside the image
+                    # CRITICAL: Skip weight accumulation for tiles that will be skipped during processing
                     x_start = max(0, x)
                     y_start = max(0, y)
                     x_end = min(self.w, x + w)
