@@ -1098,6 +1098,31 @@ class MixtureOfDiffusers(AbstractDiffusion):
         # self.pbar = tqdm(total=(self.total_bboxes) * sampling_steps, desc=f"{self.method} Sampling: ")
         # self.pbar = tqdm(total=len(self.batched_bboxes), desc=f"{self.method} Sampling: ")
 
+        # PRE-CALCULATE SKIP STATISTICS: Count how many tiles will be skipped
+        skip_threshold = getattr(self, 'skip_diffusion_below', 0)
+        if use_qt and skip_threshold > 0:
+            total_tiles = 0
+            total_skip = 0
+            skip_tile_sizes = []
+
+            for bboxes in self.batched_bboxes:
+                for bbox in bboxes:
+                    total_tiles += 1
+                    pixel_w = getattr(bbox, 'pixel_w', 0)
+                    pixel_h = getattr(bbox, 'pixel_h', 0)
+                    min_dimension = min(pixel_w, pixel_h)
+
+                    if min_dimension < skip_threshold:
+                        total_skip += 1
+                        if len(skip_tile_sizes) < 10:  # Sample first 10 for debugging
+                            skip_tile_sizes.append(f"{pixel_w}x{pixel_h}")
+
+            total_process = total_tiles - total_skip
+            print(f'[Quadtree Skip]: Will skip {total_skip}/{total_tiles} tiles (min dimension < {skip_threshold}px)')
+            print(f'[Quadtree Skip]: Processing {total_process} tiles through model, copying {total_skip} tiles directly')
+            if skip_tile_sizes:
+                print(f'[Quadtree Skip]: Sample skip sizes: {", ".join(skip_tile_sizes[:5])}{"..." if len(skip_tile_sizes) > 5 else ""}')
+
         # Global sampling
         if self.draw_background:
             for batch_id, bboxes in enumerate(self.batched_bboxes):     # batch_id is the `Latent tile batch size`
@@ -1106,7 +1131,6 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     return x_in
 
                 # SKIP LOGIC: Separate tiles into skip and process lists
-                skip_threshold = getattr(self, 'skip_diffusion_below', 0)
                 process_bboxes = []
                 skip_bboxes = []
 
@@ -1120,12 +1144,6 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             skip_bboxes.append(bbox)
                         else:
                             process_bboxes.append(bbox)
-
-                    # Log skip stats once
-                    if not hasattr(self, '_logged_skip_stats') and (skip_bboxes or process_bboxes):
-                        total = len(skip_bboxes) + len(process_bboxes)
-                        print(f'[Quadtree Skip]: Filtering {len(skip_bboxes)}/{total} tiles (min dimension < {skip_threshold}px)')
-                        self._logged_skip_stats = True
                 else:
                     # No skipping, process all tiles
                     process_bboxes = bboxes
