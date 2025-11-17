@@ -1170,38 +1170,11 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     # No skipping, process all tiles
                     process_bboxes = bboxes
 
-                # Process skip tiles: copy input directly to output buffer
-                for bbox in skip_bboxes:
-                    # Extract the input tile for this region
-                    tile_input = extract_tile_with_padding(x_in, bbox, self.w, self.h)
-
-                    # Crop to bbox size
-                    if tile_input.shape[-2] > bbox.h or tile_input.shape[-1] > bbox.w:
-                        tile_input = tile_input[:, :, :bbox.h, :bbox.w]
-
-                    # Copy directly to output buffer (no diffusion)
-                    # Handle overlap blending if enabled
-                    x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
-                    x_start = max(0, x)
-                    y_start = max(0, y)
-                    x_end = min(self.w, x + w)
-                    y_end = min(self.h, y + h)
-
-                    tile_x_offset = x_start - x
-                    tile_y_offset = y_start - y
-
-                    valid_tile = tile_input[:, :,
-                                          tile_y_offset:tile_y_offset + (y_end - y_start),
-                                          tile_x_offset:tile_x_offset + (x_end - x_start)]
-
-                    if self.tile_overlap > 0:
-                        tile_weights_full = self.get_weight(bbox.w, bbox.h)
-                        tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
-                                                        tile_x_offset:tile_x_offset + (x_end - x_start)]
-                        tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
-                        self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_tile * tile_weights
-                    else:
-                        self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_tile
+                # SKIP TILES: Return zero noise prediction (do nothing)
+                # Skipped regions remain at zero in x_buffer = zero noise prediction
+                # Sampler interprets this as: x_next = x_in - 0 = x_in (no change)
+                # This preserves current state at each denoising step
+                # Note: For txt2img this may preserve noise; consider using variable denoise instead
 
                 # Skip model inference if no tiles to process
                 if len(process_bboxes) == 0:
