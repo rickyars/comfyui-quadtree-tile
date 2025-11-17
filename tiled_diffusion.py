@@ -416,16 +416,12 @@ class AbstractDiffusion:
                 bbox.pixel_h = leaf.h
                 bbox_list.append(bbox)
 
-                # CHECK: Will this tile be skipped during sampling?
-                # Only accumulate weights for tiles that will actually contribute noise predictions
-                skip_threshold = getattr(self, 'skip_diffusion_below', 0)
-                min_dimension = min(leaf.w, leaf.h)
-                will_be_skipped = skip_threshold > 0 and min_dimension < skip_threshold
-
                 # For overlap mode, accumulate actual Gaussian weights
                 # IMPORTANT: Only accumulate weights for pixels INSIDE the image
-                # CRITICAL: Skip weight accumulation for tiles that will be skipped during processing
-                if not will_be_skipped and overlap > 0:
+                # NOTE: Weights are accumulated for ALL tiles (including skipped ones) because:
+                #  - img2img: skipped tiles contribute noise predictions (need normalization)
+                #  - txt2img: normalization handles zero contributions gracefully (0/weight=0)
+                if overlap > 0:
                     tile_weights = self.get_weight(w, h)
 
                     # Calculate the intersection of the tile with the image
@@ -444,10 +440,9 @@ class AbstractDiffusion:
                     if x_end > x_start and y_end > y_start:
                         self.weights[:, :, y_start:y_end, x_start:x_end] += \
                             tile_weights[tile_y_offset:tile_y_end_offset, tile_x_offset:tile_x_end_offset]
-                elif not will_be_skipped:
+                else:
                     # For non-overlap mode, just count coverage
                     # Only count pixels inside the image
-                    # CRITICAL: Skip weight accumulation for tiles that will be skipped during processing
                     x_start = max(0, x)
                     y_start = max(0, y)
                     x_end = min(self.w, x + w)
@@ -1076,6 +1071,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
                 print(f'[Quadtree Variable Denoise]: WARNING - Failed to load sigmas: {e}')
                 pass
 
+        # Store original latent for img2img skip feature (from store if available)
+        if not hasattr(self, 'original_latent'):
+            try:
+                from .utils import store
+                if hasattr(store, 'latent_image'):
+                    self.original_latent = store.latent_image
+                    print(f'[Quadtree Skip]: Loaded original latent for img2img, shape={self.original_latent.shape}')
+                else:
+                    self.original_latent = None  # txt2img has no original latent
+            except Exception as e:
+                print(f'[Quadtree Skip]: WARNING - Failed to load original latent: {e}')
+                self.original_latent = None
+
         self.refresh = False
         # self.refresh = True
         if self.weights is None or self.h != H or self.w != W:
@@ -1192,11 +1200,54 @@ class MixtureOfDiffusers(AbstractDiffusion):
                     # No skipping, process all tiles
                     process_bboxes = bboxes
 
-                # SKIP TILES: Return zero noise prediction (do nothing)
-                # Skipped regions remain at zero in x_buffer = zero noise prediction
-                # Sampler interprets this as: x_next = x_in - 0 = x_in (no change)
-                # This preserves current state at each denoising step
-                # Note: For txt2img this may preserve noise; consider using variable denoise instead
+                # SKIP TILES: Handle tiles that will not go through model inference
+                if len(skip_bboxes) > 0:
+                    if hasattr(self, 'original_latent') and self.original_latent is not None:
+                        # img2img: Compute noise prediction that restores original content
+                        # Formula: predicted_noise = x_in - original
+                        # Sampler does: x_next = x_in - predicted_noise = x_in - (x_in - original) = original ✓
+                        for bbox in skip_bboxes:
+                            # Extract tiles from both current noisy state and original clean latent
+                            x_in_tile = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+                            original_tile = extract_tile_with_padding(self.original_latent, bbox, self.w, self.h)
+
+                            # Crop both to bbox size if padded
+                            if x_in_tile.shape[-2] > bbox.h or x_in_tile.shape[-1] > bbox.w:
+                                x_in_tile = x_in_tile[:, :, :bbox.h, :bbox.w]
+                            if original_tile.shape[-2] > bbox.h or original_tile.shape[-1] > bbox.w:
+                                original_tile = original_tile[:, :, :bbox.h, :bbox.w]
+
+                            # Compute noise prediction that will restore original
+                            noise_prediction = x_in_tile - original_tile
+
+                            # Calculate intersection with image boundaries
+                            x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+                            x_start = max(0, x)
+                            y_start = max(0, y)
+                            x_end = min(self.w, x + w)
+                            y_end = min(self.h, y + h)
+
+                            # Calculate offset into tiles
+                            tile_x_offset = x_start - x
+                            tile_y_offset = y_start - y
+
+                            # Extract valid portion (remove padding)
+                            valid_noise = noise_prediction[:, :,
+                                                          tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                          tile_x_offset:tile_x_offset + (x_end - x_start)]
+
+                            # Add to buffer with Gaussian weighting if overlap enabled
+                            if self.tile_overlap > 0:
+                                tile_weights_full = self.get_weight(bbox.w, bbox.h)
+                                tile_weights = tile_weights_full[tile_y_offset:tile_y_offset + (y_end - y_start),
+                                                                tile_x_offset:tile_x_offset + (x_end - x_start)]
+                                tile_weights = tile_weights.unsqueeze(0).unsqueeze(0)
+                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] += valid_noise * tile_weights
+                            else:
+                                self.x_buffer[:, :, y_start:y_end, x_start:x_end] = valid_noise
+                    # else: txt2img - zero noise prediction (do nothing, stays at zero in x_buffer)
+                    # This preserves current noisy state, which for txt2img will appear gray
+                    # Recommendation: Use variable_denoise instead for txt2img workflows
 
                 # Skip model inference if no tiles to process
                 if len(process_bboxes) == 0:
