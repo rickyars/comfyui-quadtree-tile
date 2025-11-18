@@ -848,16 +848,19 @@ class MultiDiffusion(AbstractDiffusion):
                             # Progress from 0 (high noise) to 1 (low noise)
                             progress = current_step / max(total_steps, 1)
 
-                            # Map tile_denoise to starting scale factor
-                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
+                            # Map tile_denoise directly to starting scale factor
+                            # min_denoise=0 → scale=0 (no changes, complete preservation)
+                            # max_denoise=1 → scale=1 (full scheduler denoise)
+                            start_scale = tile_denoise  # Range: 0.0-1.0
 
                             # Ramp up to full strength over the schedule
-                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
+                            # Low denoise tiles ramp slower, high denoise tiles already at target
+                            ramp_curve = 1.0 + tile_denoise  # Range: 1.0-2.0
                             progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
 
-                            # Final scale factor: start_scale + remaining distance * curved progress
+                            # Final scale factor: start at tile_denoise, ramp toward 1.0
                             scale_factor = start_scale + (1.0 - start_scale) * progress_curved
-                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+                            scale_factor = max(0.0, min(1.0, scale_factor))  # Clamp to [0.0, 1.0]
 
                             # Log smooth scaling info (first tile only, once per session)
                             if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
@@ -1050,16 +1053,19 @@ class SpotDiffusion(AbstractDiffusion):
                             # Progress from 0 (high noise) to 1 (low noise)
                             progress = current_step / max(total_steps, 1)
 
-                            # Map tile_denoise to starting scale factor
-                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
+                            # Map tile_denoise directly to starting scale factor
+                            # min_denoise=0 → scale=0 (no changes, complete preservation)
+                            # max_denoise=1 → scale=1 (full scheduler denoise)
+                            start_scale = tile_denoise  # Range: 0.0-1.0
 
                             # Ramp up to full strength over the schedule
-                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
+                            # Low denoise tiles ramp slower, high denoise tiles already at target
+                            ramp_curve = 1.0 + tile_denoise  # Range: 1.0-2.0
                             progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
 
-                            # Final scale factor: start_scale + remaining distance * curved progress
+                            # Final scale factor: start at tile_denoise, ramp toward 1.0
                             scale_factor = start_scale + (1.0 - start_scale) * progress_curved
-                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+                            scale_factor = max(0.0, min(1.0, scale_factor))  # Clamp to [0.0, 1.0]
 
                             # Log smooth scaling info (first tile only, once per session)
                             if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
@@ -1439,22 +1445,19 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             #   - Start at scale=0.90, quickly ramp to 1.0
                             #   - More aggressive denoising = change more
 
-                            # Map tile_denoise to starting scale factor
-                            # FIX: Increased minimum scale from 0.4 to 0.70 to preserve color enhancement
-                            # Old formula was too aggressive, causing color washing in large tiles
-                            # Low denoise (0.2) -> start at 0.75 (75% strength) [was 0.5]
-                            # High denoise (0.8) -> start at 0.90 (90% strength) [was 0.9]
-                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
+                            # Map tile_denoise directly to starting scale factor
+                            # min_denoise=0 → scale=0 (no changes, complete preservation)
+                            # max_denoise=1 → scale=1 (full scheduler denoise)
+                            start_scale = tile_denoise  # Range: 0.0-1.0
 
                             # Ramp up to full strength over the schedule
-                            # Low denoise tiles ramp slower (gentler curve)
-                            # High denoise tiles ramp faster (steeper curve)
-                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
+                            # Low denoise tiles ramp slower, high denoise tiles already at target
+                            ramp_curve = 1.0 + tile_denoise  # Range: 1.0-2.0
                             progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
 
-                            # Final scale factor: start_scale + remaining distance * curved progress
+                            # Final scale factor: start at tile_denoise, ramp toward 1.0
                             scale_factor = start_scale + (1.0 - start_scale) * progress_curved
-                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+                            scale_factor = max(0.0, min(1.0, scale_factor))  # Clamp to [0.0, 1.0]
 
                             # Log smooth scaling info (first tile only, once per session)
                             if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
