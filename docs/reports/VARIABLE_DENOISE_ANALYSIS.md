@@ -1,20 +1,46 @@
 # Variable Denoise Feature - Analysis Report
 
 **Date**: 2025-11-18
-**Status**: ✅ Implementation appears to be working correctly
+**Status**: ⚠️ **CRITICAL BUG FOUND AND FIXED**
 
 ---
 
 ## Executive Summary
 
-The min_denoise and max_denoise parameters are **working correctly** in the current implementation. The feature:
+**🐛 CRITICAL BUG DISCOVERED**: Variable denoise code was **only implemented in MixtureOfDiffusers**. The **MultiDiffusion** and **SpotDiffusion** methods were completely missing the variable denoise implementation, causing min_denoise/max_denoise parameters to be silently ignored!
+
+**✅ STATUS**: **FIXED** - Variable denoise code has been added to all three diffusion methods.
+
+### The Bug
+
+The variable denoise implementation (lines 1326-1376) existed only in `MixtureOfDiffusers.__call__()`:
+- ✅ Denoise values were correctly assigned to tiles (tiled_vae.py:308)
+- ✅ Denoise values were stored in bbox.denoise (tiled_diffusion.py:195, 412)
+- ❌ **MultiDiffusion never used these values** - missing scaling code
+- ❌ **SpotDiffusion never used these values** - missing scaling code
+
+**Result**: Users selecting "MultiDiffusion" or "SpotDiffusion" methods had non-functional variable denoise, regardless of min_denoise/max_denoise settings.
+
+### The Fix (Commit: TBD)
+
+Added complete variable denoise implementation to:
+1. **MultiDiffusion.__call__** (tiled_diffusion.py:~758-770, ~835-871)
+   - Added sigma loading from store
+   - Added variable denoise scaling logic
+
+2. **SpotDiffusion.__call__** (tiled_diffusion.py:~1037-1072)
+   - Added variable denoise scaling logic
+   - (Already had sigma access at line 944)
+
+### After Fix
+
+The feature now works correctly across **all three diffusion methods**:
 
 1. ✅ Correctly assigns denoise values to tiles based on size
 2. ✅ Applies smooth progressive scaling through denoising steps
 3. ✅ Handles edge cases (same min/max, 0.0, 1.0) appropriately
 4. ✅ Uses mathematically sound formulas with proper clamping
-
-However, there are some **potential issues** to be aware of (documented below).
+5. ✅ **Works in MultiDiffusion, SpotDiffusion, AND MixtureOfDiffusers**
 
 ---
 

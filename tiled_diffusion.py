@@ -755,6 +755,19 @@ class MultiDiffusion(AbstractDiffusion):
         # Performance: Cache use_quadtree flag once instead of multiple getattr calls
         use_qt = getattr(self, 'use_quadtree', False)
 
+        # Store sigmas for variable denoise (from store if available)
+        if not hasattr(self, 'sigmas') or self.sigmas is None:
+            try:
+                from .utils import store
+                if hasattr(store, 'sigmas'):
+                    self.sigmas = store.sigmas
+                    print(f'[Quadtree Variable Denoise]: Loaded sigmas from store, length={len(self.sigmas)}')
+                else:
+                    print(f'[Quadtree Variable Denoise]: WARNING - No sigmas in store, variable denoise will NOT work')
+            except Exception as e:
+                print(f'[Quadtree Variable Denoise]: WARNING - Failed to load sigmas: {e}')
+                pass
+
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
         if self.weights is None or self.h != H or self.w != W:
@@ -816,8 +829,46 @@ class MultiDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
+                    # Get the output tile
+                    tile_out = x_tile_out[i*N:(i+1)*N, :, :, :]
+
+                    # VARIABLE DENOISE: Check if this tile should be active at this timestep
+                    # Only applies to quadtree mode with denoise values
+                    tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
+
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                        # Calculate progress through denoising schedule (0 = start, 1 = end)
+                        sigmas = self.sigmas
+                        ts_in = find_nearest(t_in[0], sigmas)
+                        cur_idx = (sigmas == ts_in).nonzero()
+                        if cur_idx.shape[0] > 0:
+                            current_step = cur_idx.item()
+                            total_steps = len(sigmas) - 1
+
+                            # Progress from 0 (high noise) to 1 (low noise)
+                            progress = current_step / max(total_steps, 1)
+
+                            # Map tile_denoise to starting scale factor
+                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
+
+                            # Ramp up to full strength over the schedule
+                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
+                            progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
+
+                            # Final scale factor: start_scale + remaining distance * curved progress
+                            scale_factor = start_scale + (1.0 - start_scale) * progress_curved
+                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+
+                            # Log smooth scaling info (first tile only, once per session)
+                            if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                print(f'[Quadtree Variable Denoise]: SMOOTH SCALING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, start_scale={start_scale:.3f}, scale={scale_factor:.3f}')
+                                self._logged_var_denoise = True
+
+                            # Scale the noise prediction
+                            tile_out = tile_out * scale_factor
+
                     # Both quadtree and grid tiles use accumulation with overlap
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[bbox.slicer] += tile_out
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # update progress bar
@@ -980,7 +1031,45 @@ class SpotDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
+                    # Get the output tile
+                    tile_out = x_tile_out[i*N:(i+1)*N, :, :, :]
+
+                    # VARIABLE DENOISE: Check if this tile should be active at this timestep
+                    # Only applies to quadtree mode with denoise values
+                    tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
+
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                        # Calculate progress through denoising schedule (0 = start, 1 = end)
+                        sigmas = self.sigmas
+                        ts_in = find_nearest(t_in[0], sigmas)
+                        cur_idx = (sigmas == ts_in).nonzero()
+                        if cur_idx.shape[0] > 0:
+                            current_step = cur_idx.item()
+                            total_steps = len(sigmas) - 1
+
+                            # Progress from 0 (high noise) to 1 (low noise)
+                            progress = current_step / max(total_steps, 1)
+
+                            # Map tile_denoise to starting scale factor
+                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
+
+                            # Ramp up to full strength over the schedule
+                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
+                            progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
+
+                            # Final scale factor: start_scale + remaining distance * curved progress
+                            scale_factor = start_scale + (1.0 - start_scale) * progress_curved
+                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+
+                            # Log smooth scaling info (first tile only, once per session)
+                            if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                print(f'[Quadtree Variable Denoise]: SMOOTH SCALING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, start_scale={start_scale:.3f}, scale={scale_factor:.3f}')
+                                self._logged_var_denoise = True
+
+                            # Scale the noise prediction
+                            tile_out = tile_out * scale_factor
+
+                    self.x_buffer[bbox.slicer] = tile_out
 
                 del x_tile_out, x_tile, t_tile, c_tile
 
