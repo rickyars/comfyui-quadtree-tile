@@ -755,6 +755,19 @@ class MultiDiffusion(AbstractDiffusion):
         # Performance: Cache use_quadtree flag once instead of multiple getattr calls
         use_qt = getattr(self, 'use_quadtree', False)
 
+        # Store sigmas for variable denoise (from store if available)
+        if not hasattr(self, 'sigmas') or self.sigmas is None:
+            try:
+                from .utils import store
+                if hasattr(store, 'sigmas'):
+                    self.sigmas = store.sigmas
+                    print(f'[Quadtree Variable Denoise]: Loaded sigmas from store, length={len(self.sigmas)}')
+                else:
+                    print(f'[Quadtree Variable Denoise]: WARNING - No sigmas in store, variable denoise will NOT work')
+            except Exception as e:
+                print(f'[Quadtree Variable Denoise]: WARNING - Failed to load sigmas: {e}')
+                pass
+
         # comfyui can feed in a latent that's a different size cause of SetArea, so we'll refresh in that case.
         self.refresh = False
         if self.weights is None or self.h != H or self.w != W:
@@ -816,8 +829,71 @@ class MultiDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
+                    # Get the output tile
+                    tile_out = x_tile_out[i*N:(i+1)*N, :, :, :]
+
+                    # VARIABLE DENOISE: Check if this tile should be active at this timestep
+                    # Only applies to quadtree mode with denoise values
+                    tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
+
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                        # Calculate progress through denoising schedule (0 = start, 1 = end)
+                        sigmas = self.sigmas
+                        ts_in = find_nearest(t_in[0], sigmas)
+                        cur_idx = (sigmas == ts_in).nonzero()
+                        if cur_idx.shape[0] > 0:
+                            current_step = cur_idx.item()
+                            total_steps = len(sigmas) - 1
+
+                            # Progress from 0 (high noise) to 1 (low noise)
+                            progress = current_step / max(total_steps, 1)
+
+                            # VARIABLE DENOISE: Blend between model output and original preservation
+                            # This approach works correctly for FLUX img2img with Rectified Flow
+                            if hasattr(self, 'original_latent') and self.original_latent is not None:
+                                # img2img: We have access to clean original - use blending approach
+                                # Extract the corresponding tile from the original clean latent
+                                original_tile = self.original_latent[:, :, bbox.y1:bbox.y2, bbox.x1:bbox.x2]
+                                x_in_tile = x_in[:, :, bbox.y1:bbox.y2, bbox.x1:bbox.x2]
+
+                                # Calculate skip velocity (points from current noisy toward clean original)
+                                # For FLUX (velocity prediction): skip_velocity = original - current
+                                skip_velocity = original_tile - x_in_tile
+
+                                # Blend between model output and skip velocity
+                                # tile_denoise=0 → use skip_velocity (preserve original)
+                                # tile_denoise=1 → use model_output (full denoising)
+                                # Progressive: start with denoise value, ramp toward 1.0 over time
+                                blend_strength = tile_denoise + (1.0 - tile_denoise) * progress
+                                tile_out = blend_strength * tile_out + (1.0 - blend_strength) * skip_velocity
+
+                                # Log blending info (first tile only, once per session)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                    print(f'[Quadtree Variable Denoise]: BLENDING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, blend_strength={blend_strength:.3f}')
+                                    self._logged_var_denoise = True
+                            else:
+                                # txt2img: No original available - fallback to conservative scaling
+                                # Use limited range to avoid artifacts
+                                start_scale = 0.70 + (tile_denoise * 0.30)  # Range: 0.70-1.0
+
+                                # Ramp up to full strength over the schedule
+                                ramp_curve = 1.0 + tile_denoise  # Range: 1.0-2.0
+                                progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
+
+                                # Final scale factor
+                                scale_factor = start_scale + (1.0 - start_scale) * progress_curved
+                                scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+
+                                # Log scaling info (first tile only, once per session)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                    print(f'[Quadtree Variable Denoise]: SCALING (txt2img fallback) - tile_denoise={tile_denoise:.3f}, scale={scale_factor:.3f}')
+                                    self._logged_var_denoise = True
+
+                                # Scale the model output
+                                tile_out = tile_out * scale_factor
+
                     # Both quadtree and grid tiles use accumulation with overlap
-                    self.x_buffer[bbox.slicer] += x_tile_out[i*N:(i+1)*N, :, :, :]
+                    self.x_buffer[bbox.slicer] += tile_out
                 del x_tile_out, x_tile, t_tile, c_tile
 
                 # update progress bar
@@ -980,7 +1056,70 @@ class SpotDiffusion(AbstractDiffusion):
                 x_tile_out = model_function(x_tile, t_tile, **c_tile)
 
                 for i, bbox in enumerate(bboxes):
-                    self.x_buffer[bbox.slicer] = x_tile_out[i*N:(i+1)*N, :, :, :]
+                    # Get the output tile
+                    tile_out = x_tile_out[i*N:(i+1)*N, :, :, :]
+
+                    # VARIABLE DENOISE: Check if this tile should be active at this timestep
+                    # Only applies to quadtree mode with denoise values
+                    tile_denoise = getattr(bbox, 'denoise', 1.0) if use_qt else 1.0
+
+                    if use_qt and hasattr(self, 'sigmas') and self.sigmas is not None and tile_denoise < 1.0:
+                        # Calculate progress through denoising schedule (0 = start, 1 = end)
+                        sigmas = self.sigmas
+                        ts_in = find_nearest(t_in[0], sigmas)
+                        cur_idx = (sigmas == ts_in).nonzero()
+                        if cur_idx.shape[0] > 0:
+                            current_step = cur_idx.item()
+                            total_steps = len(sigmas) - 1
+
+                            # Progress from 0 (high noise) to 1 (low noise)
+                            progress = current_step / max(total_steps, 1)
+
+                            # VARIABLE DENOISE: Blend between model output and original preservation
+                            # This approach works correctly for FLUX img2img with Rectified Flow
+                            if hasattr(self, 'original_latent') and self.original_latent is not None:
+                                # img2img: We have access to clean original - use blending approach
+                                # Extract the corresponding tile from the original clean latent
+                                original_tile = self.original_latent[:, :, bbox.y1:bbox.y2, bbox.x1:bbox.x2]
+                                x_in_tile = x_in[:, :, bbox.y1:bbox.y2, bbox.x1:bbox.x2]
+
+                                # Calculate skip velocity (points from current noisy toward clean original)
+                                # For FLUX (velocity prediction): skip_velocity = original - current
+                                skip_velocity = original_tile - x_in_tile
+
+                                # Blend between model output and skip velocity
+                                # tile_denoise=0 → use skip_velocity (preserve original)
+                                # tile_denoise=1 → use model_output (full denoising)
+                                # Progressive: start with denoise value, ramp toward 1.0 over time
+                                blend_strength = tile_denoise + (1.0 - tile_denoise) * progress
+                                tile_out = blend_strength * tile_out + (1.0 - blend_strength) * skip_velocity
+
+                                # Log blending info (first tile only, once per session)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                    print(f'[Quadtree Variable Denoise]: BLENDING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, blend_strength={blend_strength:.3f}')
+                                    self._logged_var_denoise = True
+                            else:
+                                # txt2img: No original available - fallback to conservative scaling
+                                # Use limited range to avoid artifacts
+                                start_scale = 0.70 + (tile_denoise * 0.30)  # Range: 0.70-1.0
+
+                                # Ramp up to full strength over the schedule
+                                ramp_curve = 1.0 + tile_denoise  # Range: 1.0-2.0
+                                progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
+
+                                # Final scale factor
+                                scale_factor = start_scale + (1.0 - start_scale) * progress_curved
+                                scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+
+                                # Log scaling info (first tile only, once per session)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                    print(f'[Quadtree Variable Denoise]: SCALING (txt2img fallback) - tile_denoise={tile_denoise:.3f}, scale={scale_factor:.3f}')
+                                    self._logged_var_denoise = True
+
+                                # Scale the model output
+                                tile_out = tile_out * scale_factor
+
+                    self.x_buffer[bbox.slicer] = tile_out
 
                 del x_tile_out, x_tile, t_tile, c_tile
 
@@ -1339,41 +1478,65 @@ class MixtureOfDiffusers(AbstractDiffusion):
                             # Progress from 0 (high noise) to 1 (low noise)
                             progress = current_step / max(total_steps, 1)
 
-                            # SIMPLIFIED APPROACH: Smooth scaling that works for both txt2img and img2img
-                            # Instead of on/off activation, use continuous scaling based on tile denoise
+                            # VARIABLE DENOISE: Blend between model output and original preservation
                             #
-                            # tile_denoise=0.2 (large tiles, preserve more):
-                            #   - Start at scale=0.75, smoothly ramp to 1.0
-                            #   - Less aggressive denoising = preserve more
+                            # Key insight from velocity=0 analysis:
+                            # - Scaling velocity by 0 FREEZES the tile in noisy state (looks underdeveloped)
+                            # - To actually preserve original, we need to use skip velocity formula
                             #
-                            # tile_denoise=0.8 (small tiles, change more):
-                            #   - Start at scale=0.90, quickly ramp to 1.0
-                            #   - More aggressive denoising = change more
+                            # Solution: Blend between model output and skip velocity
+                            # - tile_denoise=1.0: 100% model output (full regeneration)
+                            # - tile_denoise=0.5: 50/50 blend
+                            # - tile_denoise=0.0: 100% skip velocity (converges to clean original)
 
-                            # Map tile_denoise to starting scale factor
-                            # FIX: Increased minimum scale from 0.4 to 0.70 to preserve color enhancement
-                            # Old formula was too aggressive, causing color washing in large tiles
-                            # Low denoise (0.2) -> start at 0.75 (75% strength) [was 0.5]
-                            # High denoise (0.8) -> start at 0.90 (90% strength) [was 0.9]
-                            start_scale = 0.70 + (tile_denoise * 0.25)  # Range: 0.70-0.95
+                            if hasattr(self, 'original_latent') and self.original_latent is not None:
+                                # img2img: We have access to clean original - use blending approach
 
-                            # Ramp up to full strength over the schedule
-                            # Low denoise tiles ramp slower (gentler curve)
-                            # High denoise tiles ramp faster (steeper curve)
-                            ramp_curve = 1.0 + tile_denoise  # Range: 1.2-1.8
-                            progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
+                                # Extract corresponding tile from original clean latent
+                                original_tile = extract_tile_with_padding(self.original_latent, bbox, self.w, self.h)
 
-                            # Final scale factor: start_scale + remaining distance * curved progress
-                            scale_factor = start_scale + (1.0 - start_scale) * progress_curved
-                            scale_factor = max(0.70, min(1.0, scale_factor))  # Clamp to [0.70, 1.0]
+                                # Crop to match tile_out size (handles padding)
+                                if original_tile.shape[-2:] != tile_out.shape[-2:]:
+                                    original_tile = original_tile[:, :, :tile_out.shape[-2], :tile_out.shape[-1]]
 
-                            # Log smooth scaling info (first tile only, once per session)
-                            if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
-                                print(f'[Quadtree Variable Denoise]: SMOOTH SCALING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, start_scale={start_scale:.3f}, scale={scale_factor:.3f}')
-                                self._logged_var_denoise = True
+                                # Get corresponding input tile
+                                x_in_tile = extract_tile_with_padding(x_in, bbox, self.w, self.h)
+                                if x_in_tile.shape[-2:] != tile_out.shape[-2:]:
+                                    x_in_tile = x_in_tile[:, :, :tile_out.shape[-2], :tile_out.shape[-1]]
 
-                            # Scale the noise prediction
-                            tile_out = tile_out * scale_factor
+                                # Calculate skip velocity (points from current noisy toward clean original)
+                                # For FLUX/velocity models: skip = original - current
+                                # For SD/noise models: skip = current - original (opposite sign)
+                                # TODO: Detect model type. For now, assume FLUX (velocity)
+                                skip_velocity = original_tile - x_in_tile
+
+                                # Blend: low denoise → preserve original, high denoise → use model output
+                                # Apply progressive ramping to denoise strength
+                                blend_strength = tile_denoise + (1.0 - tile_denoise) * progress
+                                blend_strength = max(0.0, min(1.0, blend_strength))
+
+                                # Final blended output
+                                tile_out = blend_strength * tile_out + (1.0 - blend_strength) * skip_velocity
+
+                                # Log blending info (first tile only, once per session)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise'):
+                                    print(f'[Quadtree Variable Denoise]: BLENDING - tile_denoise={tile_denoise:.3f}, progress={progress:.3f}, blend_strength={blend_strength:.3f}')
+                                    self._logged_var_denoise = True
+                            else:
+                                # txt2img: No original available - fallback to scaling (weaker but works)
+                                # Use conservative range to avoid too-weak results
+                                start_scale = 0.70 + (tile_denoise * 0.30)  # Range: 0.70-1.0
+                                ramp_curve = 1.0 + tile_denoise
+                                progress_curved = min(1.0, pow(progress, 1.0 / ramp_curve))
+                                scale_factor = start_scale + (1.0 - start_scale) * progress_curved
+                                scale_factor = max(0.70, min(1.0, scale_factor))
+
+                                tile_out = tile_out * scale_factor
+
+                                # Log scaling info (first tile only, once per session)
+                                if i == 0 and batch_id == 0 and not hasattr(self, '_logged_var_denoise_txt2img'):
+                                    print(f'[Quadtree Variable Denoise]: SCALING (txt2img fallback) - tile_denoise={tile_denoise:.3f}, scale={scale_factor:.3f}')
+                                    self._logged_var_denoise_txt2img = True
 
                     if use_qt:
                         # In quadtree mode with square tiles

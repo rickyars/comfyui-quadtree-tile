@@ -109,6 +109,30 @@ The following images can be loaded in ComfyUI.
   <p>4x upscale. 3 passes.</p>
 </div>
 
+## Documentation
+
+Comprehensive documentation is available in the [`docs/`](docs/) directory:
+
+- **[Parameter Tuning Guide](docs/PARAMETER_TUNING_GUIDE.md)** - Learn how to optimize quadtree diffusion parameters
+- **[Implementation Documentation](docs/implementation/)** - Technical details about implementation
+- **[Research & Evaluation](docs/research/)** - Research findings and evaluations
+- **[Bug Analysis](docs/bug-analysis/)** - Historical bug analyses and resolutions
+- **[Reports](docs/reports/)** - Fix reports and QA summaries
+
+See the [docs/README.md](docs/README.md) for complete documentation navigation.
+
+## Testing
+
+Tests and analysis tools are available in the [`tests/`](tests/) directory:
+
+- **[Unit Tests](tests/unit/)** - Component tests
+- **[Integration Tests](tests/integration/)** - System integration tests
+- **[Analysis Tools](tests/analysis/)** - Performance and behavior analysis
+- **[Debug Tools](tests/debug/)** - Debugging and tracing utilities
+- **[Diagnostics](tests/diagnostics/)** - Feature-specific diagnostic tools
+
+See the [tests/README.md](tests/README.md) for more information on running tests.
+
 ## License
 Great thanks to all the contributors! 🎉🎉🎉   
 The implementation of MultiDiffusion, Mixture of Diffusers, and Tiled VAE code is currently under [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/) since it was borrowed from the wonderful [SD-WebUI extension](https://github.com/pkuliyi2015/multidiffusion-upscaler-for-automatic1111/). Anything else GPLv3.
