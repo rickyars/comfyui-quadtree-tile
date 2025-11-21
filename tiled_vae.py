@@ -717,11 +717,6 @@ class VAEHook:
     def __call__(self, x, **kwargs):
         # original_device = next(self.net.parameters()).device
         try:
-            # Phase 2: Smart fallback for feat_cache
-            # If using feat_cache (Qwen/Wan VAE), bypass tiling to preserve cache coherence
-            if 'feat_cache' in kwargs or 'feat_idx' in kwargs:
-                return self.net.original_forward(x, **kwargs)
-
             # if self.to_gpu:
             #     self.net = self.net.to(devices.get_optimal_device())
             B, C, H, W = x.shape
