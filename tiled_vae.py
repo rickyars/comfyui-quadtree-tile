@@ -719,12 +719,32 @@ class VAEHook:
         try:
             # if self.to_gpu:
             #     self.net = self.net.to(devices.get_optimal_device())
+
+            # Handle both 4D (standard VAE) and 5D (Qwen/Wan VAE) tensors
+            is_5d = len(x.shape) == 5
+            if is_5d:
+                # Qwen VAE uses 5D: (B, C, T, H, W)
+                B, C, T, H, W = x.shape
+                if T != 1:
+                    # Multi-frame video: bypass tiling for temporal coherence
+                    print(f"[Quadtree VAE]: Multi-frame 5D tensor {x.shape}, bypassing tiling")
+                    return self.net.original_forward(x, **kwargs)
+                # Single frame: squeeze to 4D for tiling, will unsqueeze back after
+                print(f"[Quadtree VAE]: Single-frame 5D tensor {x.shape}, tiling spatial dimensions")
+                x = x.squeeze(2)  # (B, C, 1, H, W) -> (B, C, H, W)
+
             B, C, H, W = x.shape
             if False:#max(H, W) <= self.pad * 2 + self.tile_size:
                 print("[Quadtree VAE]: the input size is tiny and unnecessary to tile.", x.shape, self.pad * 2 + self.tile_size)
-                return self.net.original_forward(x, **kwargs)
+                result = self.net.original_forward(x, **kwargs)
             else:
-                return self.vae_tile_forward(x, **kwargs)
+                result = self.vae_tile_forward(x, **kwargs)
+
+            # If input was 5D, restore the temporal dimension
+            if is_5d and result.dim() == 4:
+                result = result.unsqueeze(2)  # (B, C, H, W) -> (B, C, 1, H, W)
+
+            return result
         finally:
             pass
             # self.net = self.net.to(original_device)
