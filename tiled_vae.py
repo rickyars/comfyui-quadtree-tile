@@ -509,8 +509,14 @@ def build_task_queue(net, is_decoder):
     Build a single task queue for the encoder or decoder
     @param net: the VAE decoder or encoder network
     @param is_decoder: currently building decoder or encoder
-    @return: the task queue
+    @return: the task queue, or None if architecture is incompatible
     """
+    # Detect Encoder3d/Decoder3d (Qwen/Wan VAE) architecture
+    # These use flat down_blocks[] instead of hierarchical down[level].block[block]
+    if hasattr(net, 'down_blocks') and not hasattr(net, 'down'):
+        print(f"[Quadtree VAE]: {'Decoder3d' if is_decoder else 'Encoder3d'} detected - tiling not supported, using full forward pass")
+        return None  # Signal to bypass tiling for incompatible architecture
+
     task_queue = []
     task_queue.append(('conv_in', net.conv_in))
 
@@ -719,6 +725,12 @@ class VAEHook:
         try:
             # if self.to_gpu:
             #     self.net = self.net.to(devices.get_optimal_device())
+
+            # Check if this is Encoder3d/Decoder3d (incompatible architecture)
+            # Bypass tiling entirely for these architectures
+            if hasattr(self.net, 'down_blocks') and not hasattr(self.net, 'down'):
+                print(f"[Quadtree VAE]: {'Decoder3d' if self.is_decoder else 'Encoder3d'} detected - bypassing tiling")
+                return self.net.original_forward(x, **kwargs)
 
             # Handle both 4D (standard VAE) and 5D (Qwen/Wan VAE) tensors
             is_5d = len(x.shape) == 5
@@ -939,6 +951,12 @@ class VAEHook:
         tile_size = self.tile_size
         is_decoder = self.is_decoder
 
+        # Check architecture compatibility BEFORE doing tile splitting work
+        # Detect Encoder3d/Decoder3d (Qwen/Wan VAE) which use incompatible structure
+        if hasattr(net, 'down_blocks') and not hasattr(net, 'down'):
+            print(f"[Quadtree VAE]: {'Decoder3d' if is_decoder else 'Encoder3d'} detected - bypassing tiling")
+            return self.net.original_forward(z, **kwargs)
+
         z = z.detach() # detach the input to avoid backprop
 
         N, height, width = z.shape[0], z.shape[2], z.shape[3]
@@ -998,6 +1016,11 @@ class VAEHook:
 
         # Build task queues
         single_task_queue = build_task_queue(net, is_decoder)
+
+        # Handle incompatible architectures (e.g., Encoder3d/Decoder3d)
+        if single_task_queue is None:
+            return self.net.original_forward(z, **kwargs)
+
         if self.fast_mode:
             # Fast mode: downsample the input image to the tile size,
             # then estimate the group norm parameters on the downsampled image
