@@ -510,7 +510,14 @@ def _is_encoder3d(net):
     These architectures are incompatible with our tiling approach.
     """
     class_name = net.__class__.__name__
-    return 'Encoder3d' in class_name or 'Decoder3d' in class_name
+    is_3d = 'Encoder3d' in class_name or 'Decoder3d' in class_name
+
+    # Only log once per network instance
+    if is_3d and not hasattr(net, '_encoder3d_logged'):
+        print(f"[Quadtree VAE]: {class_name} detected - bypassing tiling")
+        net._encoder3d_logged = True
+
+    return is_3d
 
 
 def build_task_queue(net, is_decoder):
@@ -523,7 +530,6 @@ def build_task_queue(net, is_decoder):
     # Detect Encoder3d/Decoder3d (Qwen/Wan VAE) architecture
     # These use flat down_blocks[] instead of hierarchical down[level].block[block]
     if _is_encoder3d(net):
-        print(f"[Quadtree VAE]: {net.__class__.__name__} detected - incompatible architecture, using full forward pass")
         return None  # Signal to bypass tiling for incompatible architecture
 
     task_queue = []
@@ -738,7 +744,6 @@ class VAEHook:
             # Check if this is Encoder3d/Decoder3d (incompatible architecture)
             # Bypass tiling entirely for these architectures
             if _is_encoder3d(self.net):
-                print(f"[Quadtree VAE]: {self.net.__class__.__name__} detected - bypassing tiling")
                 return self.net.original_forward(x, **kwargs)
 
             # Handle both 4D (standard VAE) and 5D (Qwen/Wan VAE) tensors
@@ -963,7 +968,6 @@ class VAEHook:
         # Check architecture compatibility BEFORE doing tile splitting work
         # Detect Encoder3d/Decoder3d (Qwen/Wan VAE) which use incompatible structure
         if _is_encoder3d(net):
-            print(f"[Quadtree VAE]: {net.__class__.__name__} detected - bypassing tiling")
             return self.net.original_forward(z, **kwargs)
 
         z = z.detach() # detach the input to avoid backprop
