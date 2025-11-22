@@ -1198,7 +1198,8 @@ class MixtureOfDiffusers(AbstractDiffusion):
             if not hasattr(self, '_5d_logged'):
                 print(f"[Quadtree Diffusion]: 5D tensor detected, bypassing tiling")
                 self._5d_logged = True
-            return model_function(**args)
+            # Call model with proper arguments
+            return model_function(x_in, t_in, **{k: v for k, v in args.items() if k not in ["input", "timestep"]})
 
         N, C, H, W = x_in.shape
 
