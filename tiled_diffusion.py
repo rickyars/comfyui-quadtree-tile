@@ -1194,12 +1194,12 @@ class MixtureOfDiffusers(AbstractDiffusion):
 
         # Handle 5D tensors (Qwen models use B, C, T, H, W)
         if len(x_in.shape) == 5:
-            # For now, bypass tiling for 5D tensors - call model directly
+            # For now, bypass tiling for 5D tensors - call model directly with proper args
             if not hasattr(self, '_5d_logged'):
                 print(f"[Quadtree Diffusion]: 5D tensor detected, bypassing tiling")
                 self._5d_logged = True
-            # Call model with proper arguments
-            return model_function(x_in, t_in, **{k: v for k, v in args.items() if k not in ["input", "timestep"]})
+            # Call apply_model with the correct signature: (x, timestep, **c)
+            return model_function(x_in, t_in, **c_in)
 
         N, C, H, W = x_in.shape
 
